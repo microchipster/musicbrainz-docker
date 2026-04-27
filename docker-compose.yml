@@ -2,15 +2,10 @@
 
 volumes:
   mqdata:
-    driver: local
   pgdata:
-    driver: local
   solrdata:
-    driver: local
   dbdump:
-    driver: local
   solrdump:
-    driver: local
 
 services:
   db:
@@ -23,7 +18,7 @@ services:
         max-size: "10m"
         max-file: "10"
     restart: unless-stopped
-    command: postgres -c "shared_buffers=2048MB" -c "shared_preload_libraries=pg_amqp.so"
+    command: postgres -c "shared_buffers=2048MB" -c "maintenance_work_mem=1024MB" -c "wal_compression=on" -c "max_wal_size=16GB" -c "checkpoint_timeout=30min" -c "checkpoint_completion_target=0.9" -c "max_parallel_maintenance_workers=0" -c "max_parallel_workers_per_gather=0" -c "max_parallel_workers=0" -c "jit=off" -c "shared_preload_libraries=pg_amqp.so"
     env_file:
       - ./default/postgres.env
     shm_size: "2GB"
@@ -92,7 +87,6 @@ services:
     environment:
       - SOLR_HEAP=2g
       - LOG4J_FORMAT_MSG_NO_LOOKUPS=true
-    mem_swappiness: 1
     expose:
       - "8983"
     volumes:
