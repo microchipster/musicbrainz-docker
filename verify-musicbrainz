@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_DIR"
+
+COMPOSE_FILE_DEFAULT="docker-compose.yml:compose/replication-token.yml:compose/replication-cron.yml:compose/live-indexing-search.yml:local/compose/bind-mounts.yml"
+COMPOSE_FILE="${COMPOSE_FILE:-$COMPOSE_FILE_DEFAULT}"
+export COMPOSE_FILE
+
+SCOPE="full"
+QUIET=0
+MUSICBRAINZ_CANARY_ARTIST_ID="b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d"
+EXPECTED_SERVICES=(db mq redis search musicbrainz indexer)
+EXPECTED_COLLECTIONS=(annotation area artist cdstub editor event instrument label place recording release release-group series tag url work)
+
+while [ "$#" -gt 0 ]
+do
+    case "$1" in
+        --scope)
+            SCOPE="$2"
+            shift 2
+            ;;
+        --quiet)
+            QUIET=1
+            shift
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+log() {
+    [ "$QUIET" -eq 1 ] || printf '%s\n' "$1"
+}
+
+musicbrainz_base_url() {
+    printf 'http://%s:%s' "${MUSICBRAINZ_WEB_SERVER_HOST:-localhost}" "${MUSICBRAINZ_WEB_SERVER_PORT:-5000}"
+}
+
+require_running_services() {
+    local running
+    local service
+
+    running="$(docker compose ps --services --status running)"
+    for service in "${EXPECTED_SERVICES[@]}"
+    do
+        printf '%s\n' "$running" | grep -qx "$service" || {
+            echo "Service is not running: $service" >&2
+            return 1
+        }
+    done
+}
+
+require_replication_cron() {
+    docker compose exec -T musicbrainz crontab -l 2>/dev/null | grep -q "replication.sh" || {
+        echo "Replication cron is not installed in the musicbrainz container" >&2
+        return 1
+    }
+}
+
+require_homepage() {
+    local url
+    url="$(musicbrainz_base_url)/"
+    curl -fsS -o /dev/null "$url"
+    log "Verified homepage: $url"
+}
+
+require_artist_lookup() {
+    local url
+    local response
+    url="$(musicbrainz_base_url)/ws/2/artist/$MUSICBRAINZ_CANARY_ARTIST_ID?fmt=json"
+    response="$(curl -fsS "$url")"
+    printf '%s' "$response" | jq -e --arg id "$MUSICBRAINZ_CANARY_ARTIST_ID" '.id == $id' >/dev/null
+    log "Verified artist lookup: $url"
+}
+
+require_search_collections() {
+    local collections_json
+    local collection
+
+    collections_json="$(docker compose exec -T search sh -lc "curl -fsS 'http://localhost:8983/solr/admin/collections?action=LIST&wt=json'")"
+    for collection in "${EXPECTED_COLLECTIONS[@]}"
+    do
+        printf '%s' "$collections_json" | jq -e --arg name "$collection" '.collections | index($name) != null' >/dev/null || {
+            echo "Solr collection missing: $collection" >&2
+            return 1
+        }
+    done
+}
+
+require_search_queries() {
+    local collection
+    local response
+
+    for collection in "${EXPECTED_COLLECTIONS[@]}"
+    do
+        response="$(docker compose exec -T search sh -lc "curl -fsS 'http://localhost:8983/solr/$collection/select?q=*:*&rows=0&wt=json'")"
+        printf '%s' "$response" | jq -e '.response.numFound >= 0' >/dev/null || {
+            echo "Solr collection is not queryable: $collection" >&2
+            return 1
+        }
+    done
+}
+
+case "$SCOPE" in
+    full)
+        require_running_services
+        require_replication_cron
+        require_homepage
+        require_artist_lookup
+        require_search_collections
+        require_search_queries
+        log "Verified full deployment state"
+        ;;
+    search)
+        require_search_collections
+        require_search_queries
+        log "Verified search collections"
+        ;;
+    *)
+        echo "Unknown scope: $SCOPE" >&2
+        exit 2
+        ;;
+esac
