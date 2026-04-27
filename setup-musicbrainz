@@ -1,0 +1,1181 @@
+#!/usr/bin/env bash
+TERM="${TERM-'xterm'}"
+export TERM
+gray="$(tput setaf 8 || echo "")"
+reset="$(tput sgr0 || echo "")"
+PS4="${gray-}"'+(${BASH_SOURCE[0]}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'"${reset-}"
+set -euo pipefail
+
+# Config
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -r "$REPO_DIR/local/setup.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$REPO_DIR/local/setup.env"
+  set +a
+fi
+DATA_DIR="${MUSICBRAINZ_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/musicbrainz-docker}"
+CACHE_DIR="${MUSICBRAINZ_CACHE_DIR:-$DATA_DIR}"
+LIVE_DATA_DIR="${MUSICBRAINZ_LIVE_DATA_DIR:-$DATA_DIR}"
+DBDUMP_DIR="${DBDUMP_DIR:-$CACHE_DIR/dbdump}"
+SOLRDUMP_DIR="${SOLRDUMP_DIR:-$CACHE_DIR/solrdump}"
+PGDATA_DIR="${PGDATA_DIR:-$LIVE_DATA_DIR/pgdata}"
+MQDATA_DIR="${MQDATA_DIR:-$LIVE_DATA_DIR/mqdata}"
+SOLRDATA_DIR="${SOLRDATA_DIR:-$LIVE_DATA_DIR/solrdata}"
+REPLICATION_TOKEN_FILE="${MUSICBRAINZ_REPLICATION_TOKEN_FILE:-$REPO_DIR/local/secrets/metabrainz_access_token}"
+SEARCH_BACKUP_BASE_URL="${SEARCH_BACKUP_BASE_URL:-https://data.metabrainz.org/pub/musicbrainz/data/solr-backups}"
+SETUP_MAX_CREATEDB_ATTEMPTS="${SETUP_MAX_CREATEDB_ATTEMPTS:-1}"
+SETUP_HTTP_CHECK_RETRIES="${SETUP_HTTP_CHECK_RETRIES:-24}"
+SETUP_HTTP_CHECK_DELAY="${SETUP_HTTP_CHECK_DELAY:-5}"
+MUSICBRAINZ_ALLOW_BASE_DOWNLOADS="${MUSICBRAINZ_ALLOW_BASE_DOWNLOADS:-0}"
+MUSICBRAINZ_ALLOW_SOLR_DOWNLOADS="${MUSICBRAINZ_ALLOW_SOLR_DOWNLOADS:-0}"
+MUSICBRAINZ_ALLOW_PARTIAL_SOLR_BOOTSTRAP="${MUSICBRAINZ_ALLOW_PARTIAL_SOLR_BOOTSTRAP:-0}"
+MUSICBRAINZ_USE_HOST_LIVE_DATA="${MUSICBRAINZ_USE_HOST_LIVE_DATA:-1}"
+MUSICBRAINZ_CONFIGURE_UFW="${MUSICBRAINZ_CONFIGURE_UFW:-auto}"
+MUSICBRAINZ_REPAIR_DERIVED_DATA="${MUSICBRAINZ_REPAIR_DERIVED_DATA:-0}"
+MUSICBRAINZ_CANARY_ARTIST_ID="b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d"
+EXPECTED_SEARCH_COLLECTIONS=(annotation area artist cdstub editor event instrument label place recording release release-group series tag url work)
+REQUIRED_DUMP_FILES=(
+  mbdump.tar.bz2
+  mbdump-cdstubs.tar.bz2
+  mbdump-cover-art-archive.tar.bz2
+  mbdump-event-art-archive.tar.bz2
+  mbdump-derived.tar.bz2
+  mbdump-stats.tar.bz2
+  mbdump-wikidocs.tar.bz2
+)
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+run_phase() {
+  local name="$1"
+  local status=0
+  shift
+
+  log "Starting: $name"
+  "$@" || status=$?
+  if [ "$status" -ne 0 ]; then
+    log "Failed: $name (exit $status)"
+    return "$status"
+  fi
+
+  log "Finished: $name"
+}
+
+truthy() {
+  case "${1:-}" in
+    1 | true | TRUE | yes | YES | on | ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+have_passwordless_sudo() {
+  [ "$(id -u)" -eq 0 ] || sudo -n true > /dev/null 2>&1
+}
+
+run_privileged() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  elif have_passwordless_sudo; then
+    sudo -n "$@"
+  else
+    "$@"
+  fi
+}
+
+path_is_dir() {
+  [ -d "$1" ] || sudo -n test -d "$1" > /dev/null 2>&1
+}
+
+path_is_file() {
+  [ -f "$1" ] || sudo -n test -f "$1" > /dev/null 2>&1
+}
+
+path_is_nonempty_file() {
+  [ -s "$1" ] || sudo -n test -s "$1" > /dev/null 2>&1
+}
+
+postgres_data_initialized() {
+  path_is_nonempty_file "$PGDATA_DIR/PG_VERSION"
+}
+
+mq_data_initialized() {
+  path_is_dir "$MQDATA_DIR/mnesia" || path_is_nonempty_file "$MQDATA_DIR/.erlang.cookie"
+}
+
+solr_data_initialized() {
+  path_is_dir "$SOLRDATA_DIR/data" || path_is_file "$SOLRDATA_DIR/solr.xml"
+}
+
+should_use_host_live_data() {
+  local service="$1"
+
+  case "$MUSICBRAINZ_USE_HOST_LIVE_DATA" in
+    1 | true | TRUE | yes | YES | on | ON) return 0 ;;
+    0 | false | FALSE | no | NO | off | OFF) return 1 ;;
+    auto)
+      case "$service" in
+        pgdata) postgres_data_initialized ;;
+        mqdata) mq_data_initialized ;;
+        solrdata) solr_data_initialized ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *)
+      echo "Invalid MUSICBRAINZ_USE_HOST_LIVE_DATA=$MUSICBRAINZ_USE_HOST_LIVE_DATA; use auto, 1, or 0" >&2
+      return 2
+      ;;
+  esac
+}
+
+load_replication_token() {
+  if [ -n "${MUSICBRAINZ_REPLICATION_TOKEN:-}" ]; then
+    printf '%s\n' "$MUSICBRAINZ_REPLICATION_TOKEN"
+    return
+  fi
+
+  if [ -r "$REPLICATION_TOKEN_FILE" ]; then
+    tr -d '\r\n' < "$REPLICATION_TOKEN_FILE"
+    printf '\n'
+    return
+  fi
+
+  cat >&2 << EOF
+Missing MusicBrainz replication token.
+Set MUSICBRAINZ_REPLICATION_TOKEN, or write the token to:
+  $REPLICATION_TOKEN_FILE
+EOF
+  return 1
+}
+
+log "Using already-checked-out repository at $REPO_DIR"
+cd "$REPO_DIR"
+
+SCRIPT_DIR="$REPO_DIR"
+CACHE_HELPER="$SCRIPT_DIR/scripts/setup_cache.py"
+VERIFY_SCRIPT="$SCRIPT_DIR/verify-musicbrainz"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$(basename "$REPO_DIR")}"
+USE_HOST_PGDATA=0
+USE_HOST_MQDATA=0
+USE_HOST_SOLRDATA=0
+
+case "$MUSICBRAINZ_USE_HOST_LIVE_DATA" in
+  auto | 1 | true | TRUE | yes | YES | on | ON | 0 | false | FALSE | no | NO | off | OFF) ;;
+  *)
+    echo "Invalid MUSICBRAINZ_USE_HOST_LIVE_DATA=$MUSICBRAINZ_USE_HOST_LIVE_DATA; use auto, 1, or 0" >&2
+    exit 2
+    ;;
+esac
+
+if should_use_host_live_data pgdata; then
+  USE_HOST_PGDATA=1
+fi
+
+if should_use_host_live_data mqdata; then
+  USE_HOST_MQDATA=1
+fi
+
+if should_use_host_live_data solrdata; then
+  USE_HOST_SOLRDATA=1
+fi
+
+log "Live data mode: pgdata=$USE_HOST_PGDATA ($PGDATA_DIR), mqdata=$USE_HOST_MQDATA ($MQDATA_DIR), solrdata=$USE_HOST_SOLRDATA ($SOLRDATA_DIR)"
+
+log "Data root: $DATA_DIR"
+log "Cache root: $CACHE_DIR"
+log "Live data root: $LIVE_DATA_DIR"
+log "Dump cache: $DBDUMP_DIR"
+log "Solr backup cache: $SOLRDUMP_DIR"
+log "Preparing data directories and Compose bind-mount override"
+mkdir -p "$DBDUMP_DIR" "$SOLRDUMP_DIR"
+if [ "$USE_HOST_PGDATA" -eq 1 ]; then
+  mkdir -p "$PGDATA_DIR"
+fi
+if [ "$USE_HOST_MQDATA" -eq 1 ]; then
+  mkdir -p "$MQDATA_DIR"
+fi
+if [ "$USE_HOST_SOLRDATA" -eq 1 ]; then
+  mkdir -p "$SOLRDATA_DIR"
+fi
+mkdir -p local/compose
+mkdir -p local/secrets
+REPLICATION_TOKEN="$(load_replication_token)"
+
+if [ ! -r local/secrets/metabrainz_access_token ] || ! grep -qxF "$REPLICATION_TOKEN" local/secrets/metabrainz_access_token; then
+  log "Writing replication token secret"
+  printf '%s\n' "$REPLICATION_TOKEN" > local/secrets/metabrainz_access_token
+  chmod 600 local/secrets/metabrainz_access_token
+fi
+
+# Create override file for bind mounts
+{
+  cat << EOF
+# Description: Keep MusicBrainz caches and live service data on configured host paths.
+# Data root: $DATA_DIR
+# Cache root: $CACHE_DIR
+# Live data root: $LIVE_DATA_DIR
+
+volumes:
+  dbdump:
+    external: true
+    name: ${COMPOSE_PROJECT_NAME}_dbdump
+  solrdump:
+    external: true
+    name: ${COMPOSE_PROJECT_NAME}_solrdump
+EOF
+
+  if [ "$USE_HOST_PGDATA" -eq 1 ]; then
+    cat << EOF
+  pgdata:
+    external: true
+    name: ${COMPOSE_PROJECT_NAME}_pgdata
+EOF
+  fi
+
+  if [ "$USE_HOST_MQDATA" -eq 1 ]; then
+    cat << EOF
+  mqdata:
+    external: true
+    name: ${COMPOSE_PROJECT_NAME}_mqdata
+EOF
+  fi
+
+  if [ "$USE_HOST_SOLRDATA" -eq 1 ]; then
+    cat << EOF
+  solrdata:
+    external: true
+    name: ${COMPOSE_PROJECT_NAME}_solrdata
+EOF
+  fi
+} > local/compose/bind-mounts.yml
+
+admin/configure with docker-compose.yml compose/replication-token.yml compose/replication-cron.yml compose/live-indexing-search.yml local/compose/bind-mounts.yml > /dev/null
+log "Compose files configured with local/compose/bind-mounts.yml"
+
+# Set COMPOSE_FILE to include our override
+export COMPOSE_FILE="docker-compose.yml:compose/replication-token.yml:compose/replication-cron.yml:compose/live-indexing-search.yml:local/compose/bind-mounts.yml"
+
+# Core functions
+db_initialized() {
+  # A healthy import creates the metadata table in the `musicbrainz` schema
+  # and loads at least one track row from the main dump.
+  db_exists || return 1
+  docker compose exec -T db psql -U musicbrainz -d musicbrainz_db -tAc "
+        SELECT CASE
+                 WHEN to_regclass('musicbrainz.replication_control') IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM musicbrainz.replication_control)
+                  AND to_regclass('musicbrainz.track') IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM musicbrainz.track)
+                 THEN 1
+                 ELSE 0
+               END
+    " 2> /dev/null | grep -qx '1'
+}
+
+db_exists() {
+  docker compose exec -T db psql -U musicbrainz -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = 'musicbrainz_db'" | grep -qx '1'
+}
+
+db_schema_sequence() {
+  docker compose exec -T db psql -U musicbrainz -d musicbrainz_db -tAc \
+    "SELECT current_schema_sequence FROM musicbrainz.replication_control" 2> /dev/null
+}
+
+upgrade_schema_sequence() {
+  docker compose run --rm musicbrainz bash -c \
+    "sed -n 's/^export MUSICBRAINZ_DB_SCHEMA_SEQUENCE=//p' /usr/local/bin/upgrade-db-schema.sh 2>/dev/null | head -n 1"
+}
+
+run_database_upgrade_if_needed() {
+  local current_sequence upgrade_from_sequence
+
+  current_sequence="$(db_schema_sequence)"
+  upgrade_from_sequence="$(upgrade_schema_sequence)"
+
+  if [ -z "$upgrade_from_sequence" ]; then
+    log "No database schema upgrade helper found in the MusicBrainz image; skipping upgrade check"
+    return
+  fi
+
+  if [ "$current_sequence" != "$upgrade_from_sequence" ]; then
+    log "Database schema sequence is $current_sequence; upgrade helper applies from $upgrade_from_sequence, so no upgrade is needed"
+    return
+  fi
+
+  log "Database schema sequence is $current_sequence; running database schema upgrade"
+  docker compose run --rm musicbrainz /usr/local/bin/upgrade-db-schema.sh
+}
+
+reset_db() {
+  log "Resetting existing musicbrainz_db before re-import"
+  docker compose stop musicbrainz indexer || :
+  docker compose exec -T db psql -U musicbrainz -d postgres << 'SQL'
+SELECT pg_terminate_backend(pid)
+  FROM pg_stat_activity
+ WHERE datname = 'musicbrainz_db'
+   AND pid <> pg_backend_pid();
+DROP DATABASE IF EXISTS musicbrainz_db;
+SQL
+}
+
+dump_use_acknowledged() {
+  [ -e "$DBDUMP_DIR/.for-commercial-use" ] || [ -e "$DBDUMP_DIR/.for-non-commercial-use" ]
+}
+
+validate_cached_dumps() {
+  local dump_dir="$DBDUMP_DIR"
+  local md5_file="$dump_dir/MD5SUMS"
+  local line
+  local file
+
+  [ -r "$md5_file" ] || return
+
+  log "Validating existing cached dump checksums in $dump_dir"
+
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[0-9a-fA-F]{32}[[:space:]][\ \*](.+\.tar\.bz2)$ ]] || continue
+    file="${BASH_REMATCH[1]}"
+
+    [ -e "$dump_dir/$file" ] || continue
+
+    if ! (cd "$dump_dir" && printf '%s\n' "$line" | md5sum -c --status); then
+      log "Removing corrupted cached dump: $file"
+      rm -f -- "$dump_dir/$file"
+      continue
+    fi
+
+    if command -v bzip2 > /dev/null && ! bzip2 -t -- "$dump_dir/$file" > /dev/null 2>&1; then
+      log "Removing unreadable cached dump: $file"
+      rm -f -- "$dump_dir/$file"
+    fi
+  done < "$md5_file"
+}
+
+prepare_import_patch_sources() {
+  python3 "$CACHE_HELPER" prepare-import-patch-sources "$DBDUMP_DIR" "$DBDUMP_DIR/patch-sources/mbdump"
+}
+
+cached_dumps_ready() {
+  local file
+  local ready=0
+
+  if [ ! -r "$DBDUMP_DIR/MD5SUMS" ]; then
+    log "Missing cached dump checksum file: $DBDUMP_DIR/MD5SUMS"
+    ready=1
+  fi
+
+  for file in "${REQUIRED_DUMP_FILES[@]}"; do
+    if [ ! -e "$DBDUMP_DIR/$file" ]; then
+      log "Missing required cached dump: $DBDUMP_DIR/$file"
+      ready=1
+    fi
+  done
+
+  return "$ready"
+}
+
+compose_volume_name() {
+  printf '%s_%s' "$COMPOSE_PROJECT_NAME" "$1"
+}
+
+compose_service_image() {
+  printf '%s-%s:latest' "$COMPOSE_PROJECT_NAME" "$1"
+}
+
+image_exists() {
+  docker image inspect "$1" > /dev/null 2>&1
+}
+
+build_images() {
+  log "Building Docker images with Compose"
+  docker compose build db mq search musicbrainz indexer
+}
+
+ensure_images() {
+  if ! image_exists "musicbrainz-docker_db:${POSTGRES_VERSION:-16}" \
+    || ! image_exists "musicbrainz-docker_search:${MB_SOLR_VERSION:-4.1.0}" \
+    || ! image_exists "$(compose_service_image mq)" \
+    || ! image_exists "$(compose_service_image musicbrainz)" \
+    || ! image_exists "$(compose_service_image indexer)"; then
+    build_images
+  else
+    log "Refreshing Docker images with Compose cache"
+    build_images
+  fi
+}
+
+docker_cgroup_driver() {
+  docker info --format '{{.CgroupDriver}}' 2> /dev/null || :
+}
+
+systemd_manager_available() {
+  systemctl show --property=Version --value > /dev/null 2>&1 \
+    || sudo -n systemctl show --property=Version --value > /dev/null 2>&1
+}
+
+ensure_host_runtime_healthy() {
+  [ "$(docker_cgroup_driver)" = systemd ] || return
+  systemd_manager_available && return
+
+  cat >&2 << 'EOF'
+Docker is configured with the systemd cgroup driver, but the host systemd
+manager is not responding. Docker cannot start new containers in this state.
+
+This is a host runtime failure, not a MusicBrainz cache/import failure. Reboot
+the host, then rerun ./setup-musicbrainz.
+EOF
+  return 1
+}
+
+wait_for_db() {
+  local attempt
+
+  for attempt in $(seq 1 60); do
+    if docker compose exec -T db pg_isready -U musicbrainz -d postgres > /dev/null 2>&1; then
+      log "PostgreSQL is ready"
+      return
+    fi
+
+    if [ "$attempt" -eq 1 ] || [ $((attempt % 10)) -eq 0 ]; then
+      log "Still waiting for PostgreSQL ($attempt/60)"
+    fi
+    sleep 2
+  done
+
+  echo "Database service did not become ready"
+  return 1
+}
+
+ensure_ufw_web_rule() {
+  local port
+
+  command -v ufw > /dev/null 2>&1 || return 0
+  if ! run_privileged ufw status 2> /dev/null | grep -q '^Status: active'; then
+    return 0
+  fi
+
+  port="${MUSICBRAINZ_WEB_SERVER_PORT:-5000}"
+  case "$MUSICBRAINZ_CONFIGURE_UFW" in
+    1 | true | TRUE | yes | YES | on | ON | auto)
+      if ! have_passwordless_sudo; then
+        log "UFW is active; allow MusicBrainz manually with: sudo ufw allow ${port}/tcp"
+        return
+      fi
+
+      log "Ensuring UFW allows MusicBrainz web port $port/tcp"
+      run_privileged ufw allow proto tcp to any port "$port" comment 'MusicBrainz Docker web' > /dev/null
+      ;;
+    0 | false | FALSE | no | NO | off | OFF)
+      log "UFW is active; MUSICBRAINZ_CONFIGURE_UFW is disabled, so no firewall rule was added"
+      ;;
+    *)
+      echo "Invalid MUSICBRAINZ_CONFIGURE_UFW=$MUSICBRAINZ_CONFIGURE_UFW; use auto, 1, or 0" >&2
+      return 2
+      ;;
+  esac
+}
+
+start_core_services() {
+  ensure_host_runtime_healthy
+  log "Starting core services: db mq redis search"
+  docker compose up -d --no-build db mq redis search
+  log "Waiting for PostgreSQL to accept connections"
+  wait_for_db
+}
+
+ensure_local_volume() {
+  local volume="$1"
+  shift
+  local volume_name
+  local configured_device
+  local configured_opts
+  volume_name="$(compose_volume_name "$volume")"
+
+  if ! docker volume inspect "$volume_name" > /dev/null 2>&1; then
+    log "Volume $volume_name will be created by Docker Compose"
+    return
+  fi
+
+  configured_device="$(docker volume inspect -f '{{ index .Options "device" }}' "$volume_name" 2> /dev/null || :)"
+  configured_opts="$(docker volume inspect -f '{{ index .Options "type" }}:{{ index .Options "o" }}' "$volume_name" 2> /dev/null || :)"
+
+  if [ -z "$configured_device" ] && { [ -z "$configured_opts" ] || [ "$configured_opts" = ':' ] || [ "$configured_opts" = '<no value>:<no value>' ]; }; then
+    log "Volume $volume_name is already a local Docker volume"
+    return
+  fi
+
+  log "Recreating $volume_name as a local Docker volume"
+  docker compose stop "$@" || :
+  docker compose rm -f "$@" || :
+  docker volume rm -f "$volume_name" || :
+  log "Volume $volume_name will be recreated by Docker Compose"
+}
+
+ensure_bind_volume() {
+  local volume="$1"
+  local device="$2"
+  shift 2
+  local volume_name
+  local configured_device
+  local configured_opts
+  local container_ids
+  volume_name="$(compose_volume_name "$volume")"
+  configured_device="$(docker volume inspect -f '{{ index .Options "device" }}' "$volume_name" 2> /dev/null || :)"
+  configured_opts="$(docker volume inspect -f '{{ index .Options "type" }}:{{ index .Options "o" }}' "$volume_name" 2> /dev/null || :)"
+
+  if [ "$configured_device" = "$device" ] && [ "$configured_opts" = 'none:bind' ]; then
+    log "Volume $volume_name already bind-mounted to $device"
+    return
+  fi
+
+  log "Recreating $volume_name as a bind mount to $device"
+  docker compose stop "$@" || :
+  docker compose rm -f "$@" || :
+  container_ids="$(docker ps -aq --filter volume="$volume_name")"
+  [ -z "$container_ids" ] || docker rm -f $container_ids || :
+  docker volume rm -f "$volume_name" || :
+  docker volume create \
+    --driver local \
+    --opt type=none \
+    --opt o=bind \
+    --opt "device=$device" \
+    "$volume_name" > /dev/null
+}
+
+ensure_volume_permissions() {
+  local volume_name=$1
+  local uid=$2
+  local gid=$3
+  local mode=$4
+  local configured_device
+
+  docker volume inspect "$volume_name" > /dev/null 2>&1 || return 0
+  configured_device="$(docker volume inspect -f '{{ index .Options "device" }}' "$volume_name" 2> /dev/null || :)"
+
+  if [ -n "$configured_device" ] && [ "$configured_device" != '<no value>' ]; then
+    log "Ensuring permissions on bind-mounted volume path $configured_device"
+    if [ -n "$uid" ] && [ -n "$gid" ]; then
+      run_privileged chown "$uid:$gid" "$configured_device"
+    fi
+    run_privileged chmod "$mode" "$configured_device"
+    return
+  fi
+
+  if [ -n "$uid" ] && [ -n "$gid" ]; then
+    log "Ensuring permissions on Docker volume $volume_name"
+    docker run --rm -v "$volume_name:/mnt" redis:3-alpine sh -lc "chown $uid:$gid /mnt && chmod $mode /mnt"
+  else
+    log "Ensuring permissions on Docker volume $volume_name"
+    docker run --rm -v "$volume_name:/mnt" redis:3-alpine sh -lc "chmod $mode /mnt"
+  fi
+}
+
+ensure_host_writable_search_cache() {
+  local uid gid
+
+  uid="$(id -u)"
+  gid="$(id -g)"
+
+  if [ ! -w "$SOLRDUMP_DIR" ]; then
+    run_privileged chown "$uid:$gid" "$SOLRDUMP_DIR"
+  fi
+  run_privileged chmod 775 "$SOLRDUMP_DIR"
+}
+
+clear_host_directory_contents() {
+  local directory="$1"
+  local directory_normalized
+  local mq_normalized
+  local protected
+  local protected_normalized
+  local solr_normalized
+
+  [ -n "$directory" ] && [ "$directory" != / ] || {
+    echo "Refusing to clear unsafe directory: $directory" >&2
+    return 1
+  }
+
+  directory_normalized="$(realpath -m "$directory")"
+  mq_normalized="$(realpath -m "$MQDATA_DIR")"
+  solr_normalized="$(realpath -m "$SOLRDATA_DIR")"
+
+  if [ "$directory_normalized" != "$mq_normalized" ] && [ "$directory_normalized" != "$solr_normalized" ]; then
+    echo "Refusing to clear unmanaged directory: $directory" >&2
+    return 1
+  fi
+
+  for protected in "$DATA_DIR" "$DBDUMP_DIR" "$SOLRDUMP_DIR" "$PGDATA_DIR"; do
+    protected_normalized="$(realpath -m "$protected")"
+    if [ "$directory_normalized" = "$protected_normalized" ]; then
+      echo "Refusing to clear protected directory: $directory" >&2
+      return 1
+    fi
+  done
+
+  mkdir -p "$directory"
+  run_privileged find "$directory" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+}
+
+reset_mq_data() {
+  if ! truthy "$MUSICBRAINZ_REPAIR_DERIVED_DATA"; then
+    cat >&2 << EOF
+RabbitMQ state still failed verification after a service recreate.
+Refusing to clear derived RabbitMQ data unless MUSICBRAINZ_REPAIR_DERIVED_DATA=1.
+EOF
+    return 1
+  fi
+
+  log "Resetting RabbitMQ derived state"
+  docker compose stop indexer mq || :
+  docker compose rm -f indexer mq || :
+
+  if [ "$USE_HOST_MQDATA" -eq 1 ]; then
+    clear_host_directory_contents "$MQDATA_DIR"
+    ensure_bind_volume mqdata "$MQDATA_DIR" mq
+  else
+    docker volume rm -f "$(compose_volume_name mqdata)" || :
+    ensure_local_volume mqdata mq
+  fi
+
+  docker compose up -d --no-build mq
+  wait_for_mq
+}
+
+reset_search_data() {
+  if ! truthy "$MUSICBRAINZ_REPAIR_DERIVED_DATA"; then
+    cat >&2 << EOF
+Solr state still failed verification after bootstrap.
+Refusing to clear derived Solr data unless MUSICBRAINZ_REPAIR_DERIVED_DATA=1.
+EOF
+    return 1
+  fi
+
+  log "Resetting Solr derived state"
+  docker compose stop indexer search || :
+  docker compose rm -f indexer search || :
+
+  if [ "$USE_HOST_SOLRDATA" -eq 1 ]; then
+    clear_host_directory_contents "$SOLRDATA_DIR"
+    ensure_bind_volume solrdata "$SOLRDATA_DIR" search
+  else
+    docker volume rm -f "$(compose_volume_name solrdata)" || :
+    ensure_local_volume solrdata search
+  fi
+
+  ensure_volume_permissions "$(compose_volume_name solrdata)" 8983 8983 775
+  docker compose up -d --no-build search
+}
+
+run_createdb() {
+  log "Preparing database dump cache before import"
+
+  if ! cached_dumps_ready; then
+    if ! truthy "$MUSICBRAINZ_ALLOW_BASE_DOWNLOADS"; then
+      cat >&2 << EOF
+Cached MusicBrainz base dumps are incomplete in $DBDUMP_DIR.
+Refusing to run createdb.sh -fetch because MUSICBRAINZ_ALLOW_BASE_DOWNLOADS is not enabled.
+Populate the cache from an existing deployment, or rerun with MUSICBRAINZ_ALLOW_BASE_DOWNLOADS=1.
+EOF
+      return 1
+    fi
+
+    if dump_use_acknowledged; then
+      log "Starting createdb.sh -fetch because base downloads were explicitly enabled"
+      docker compose run --rm musicbrainz createdb.sh -fetch
+    else
+      log "Starting interactive createdb.sh -fetch acknowledgement because base downloads were explicitly enabled"
+      expect -c '
+              spawn docker compose run --rm musicbrainz createdb.sh -fetch
+              expect "commercial"
+              send "n\r"
+              expect "Press any key when OK"
+              send "\r"
+              expect eof
+              catch wait result
+              exit [lindex $result 3]
+          '
+    fi
+    return
+  fi
+
+  validate_cached_dumps || return $?
+  if ! cached_dumps_ready; then
+    log "Cached dump validation removed one or more required dumps"
+    return 1
+  fi
+
+  log "Cached MusicBrainz dumps are complete; preparing import patch sources"
+  prepare_import_patch_sources || return $?
+  log "Starting createdb.sh with cached dumps; this can take a long time and will stream import output"
+  docker compose run --rm musicbrainz createdb.sh
+}
+
+initialize_db() {
+  local attempt
+  local createdb_status
+
+  for attempt in $(seq 1 "$SETUP_MAX_CREATEDB_ATTEMPTS"); do
+    log "Database initialization attempt $attempt/$SETUP_MAX_CREATEDB_ATTEMPTS"
+    db_exists && reset_db
+
+    createdb_status=0
+    run_createdb || createdb_status=$?
+    if [ "$createdb_status" -eq 0 ] && db_initialized; then
+      log "Database initialization succeeded"
+      return
+    fi
+
+    if [ "$createdb_status" -ne 0 ]; then
+      log "createdb.sh failed with exit $createdb_status; database import output above contains the root cause"
+    else
+      log "createdb.sh exited successfully, but database verification did not pass"
+    fi
+
+    if [ "$attempt" -lt "$SETUP_MAX_CREATEDB_ATTEMPTS" ]; then
+      log "MusicBrainz DB initialization attempt $attempt/$SETUP_MAX_CREATEDB_ATTEMPTS failed; retrying"
+      sleep 5
+    fi
+  done
+
+  db_exists && reset_db
+  echo "MusicBrainz DB initialization failed after $SETUP_MAX_CREATEDB_ATTEMPTS attempts"
+  return 1
+}
+
+musicbrainz_base_url() {
+  printf 'http://%s:%s' "${MUSICBRAINZ_WEB_SERVER_HOST:-localhost}" "${MUSICBRAINZ_WEB_SERVER_PORT:-5000}"
+}
+
+wait_for_http_status() {
+  local description="$1"
+  local url="$2"
+  local attempt
+  local http_code
+
+  for attempt in $(seq 1 "$SETUP_HTTP_CHECK_RETRIES"); do
+    http_code="$(curl -fsS -o /dev/null -w '%{http_code}' "$url" 2> /dev/null || :)"
+
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+      log "Verified $description with HTTP $http_code: $url"
+      return
+    fi
+
+    if [ "$attempt" -eq 1 ] || [ $((attempt % 6)) -eq 0 ]; then
+      log "Still waiting for $description ($attempt/$SETUP_HTTP_CHECK_RETRIES, last HTTP status: ${http_code:-none})"
+    fi
+    sleep "$SETUP_HTTP_CHECK_DELAY"
+  done
+
+  echo "Failed sanity check for $description: curl -fsS -o /dev/null '$url'"
+  return 1
+}
+
+wait_for_artist_lookup() {
+  local base_url
+  local url
+  local attempt
+  local response
+
+  base_url="$(musicbrainz_base_url)"
+  url="$base_url/ws/2/artist/$MUSICBRAINZ_CANARY_ARTIST_ID?fmt=json"
+
+  for attempt in $(seq 1 "$SETUP_HTTP_CHECK_RETRIES"); do
+    response="$(curl -fsS "$url" 2> /dev/null || :)"
+
+    if [ -n "$response" ] && printf '%s' "$response" | jq -e --arg id "$MUSICBRAINZ_CANARY_ARTIST_ID" '.id == $id' > /dev/null; then
+      log "Verified MusicBrainz artist lookup: $url"
+      return
+    fi
+
+    if [ "$attempt" -eq 1 ] || [ $((attempt % 6)) -eq 0 ]; then
+      log "Still waiting for MusicBrainz artist lookup ($attempt/$SETUP_HTTP_CHECK_RETRIES)"
+    fi
+    sleep "$SETUP_HTTP_CHECK_DELAY"
+  done
+
+  echo "Failed sanity check for MusicBrainz artist lookup: curl -fsS '$url'"
+  return 1
+}
+
+cron_enabled() {
+  docker compose exec -T musicbrainz crontab -l 2> /dev/null | grep -q "replication.sh"
+}
+
+wait_for_mq() {
+  local attempt
+
+  for attempt in $(seq 1 "$SETUP_HTTP_CHECK_RETRIES"); do
+    if docker compose exec -T mq rabbitmqctl list_users > /dev/null 2>&1; then
+      log "RabbitMQ is ready"
+      return
+    fi
+
+    if [ "$attempt" -eq 1 ] || [ $((attempt % 6)) -eq 0 ]; then
+      log "Still waiting for RabbitMQ ($attempt/$SETUP_HTTP_CHECK_RETRIES)"
+    fi
+    sleep "$SETUP_HTTP_CHECK_DELAY"
+  done
+
+  echo "RabbitMQ service did not become ready"
+  return 1
+}
+
+mq_user_exists() {
+  docker compose exec -T mq rabbitmqctl list_users 2> /dev/null | awk '{print $1}' | grep -qx 'sir'
+}
+
+amqp_extension_enabled() {
+  docker compose exec -T db psql -U musicbrainz -d musicbrainz_db -tAc "SELECT 1 FROM pg_extension WHERE extname = 'amqp'" | grep -qx '1'
+}
+
+clean_stale_amqp_extension_files() {
+  if [ -e admin/.create-amqp-extension.sql ]; then
+    log "Removing stale local AMQP extension install file"
+    rm -f admin/.create-amqp-extension.sql
+  fi
+
+  docker compose exec -T db rm -f /tmp/CreateExtensionAMQP.sql
+}
+
+amqp_triggers_installed() {
+  docker compose exec -T db psql -U musicbrainz -d musicbrainz_db -tAc "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname LIKE 'search_%') THEN 1 ELSE 0 END" | grep -qx '1'
+}
+
+search_collections_json() {
+  docker compose exec -T search sh -lc "curl -fsS 'http://localhost:8983/solr/admin/collections?action=LIST&wt=json'"
+}
+
+search_collection_exists() {
+  local collection="$1"
+
+  search_collections_json | jq -e --arg name "$collection" '.collections | index($name) != null' > /dev/null
+}
+
+ensure_search_collection_present() {
+  local collection="$1"
+  local shards="$2"
+
+  if search_collection_exists "$collection"; then
+    log "Solr collection $collection already exists"
+    return
+  fi
+
+  log "Creating Solr collection $collection"
+  docker compose exec -T search sh -lc "set -e; \
+        curl -fsS -X PUT 'http://localhost:8983/api/cluster/configs/$collection' \
+            -H 'Content-Type: application/octet-stream' \
+            --data-binary @/usr/lib/mbsssss/$collection.zip >/dev/null; \
+        curl -fsS 'http://localhost:8983/solr/admin/collections?action=CREATE&name=$collection&collection.configName=$collection&numShards=$shards&replicationFactor=1&nrtReplicas=1&wt=json' >/dev/null"
+}
+
+ensure_search_seed_collections() {
+  # Solr backups do not include `editor`, and `work` has previously failed to
+  # restore cleanly when ZooKeeper still had leftover config state. Create the
+  # minimum missing collections explicitly so the AMQP watcher always has the
+  # endpoints it expects.
+  ensure_search_collection_present editor 1
+  ensure_search_collection_present work 1
+}
+
+ensure_all_search_collections() {
+  local collection
+
+  for collection in "${EXPECTED_SEARCH_COLLECTIONS[@]}"; do
+    ensure_search_collection_present "$collection" 1
+  done
+}
+
+search_index_ready() {
+  "$VERIFY_SCRIPT" --scope search --quiet > /dev/null
+}
+
+repair_search_backup_cache() {
+  python3 "$CACHE_HELPER" repair-solr-cache "$SOLRDUMP_DIR"
+}
+
+search_backup_cache_ready() {
+  python3 "$CACHE_HELPER" verify-solr-cache "$SOLRDUMP_DIR"
+}
+
+fetch_search_backup_archives() {
+  local base_url latest current_latest failed_files checksum filename actual tmpfile
+
+  if search_backup_cache_ready; then
+    log "Using existing verified Solr backup cache from $SOLRDUMP_DIR"
+    return
+  fi
+
+  if ! truthy "$MUSICBRAINZ_ALLOW_SOLR_DOWNLOADS"; then
+    cat >&2 << EOF
+Cached Solr backup archives are incomplete in $SOLRDUMP_DIR.
+Refusing to download Solr backups because MUSICBRAINZ_ALLOW_SOLR_DOWNLOADS is not enabled.
+Populate the cache from an existing deployment, or rerun with MUSICBRAINZ_ALLOW_SOLR_DOWNLOADS=1.
+EOF
+    return 1
+  fi
+
+  base_url="${SEARCH_BACKUP_BASE_URL%/}"
+  log "Fetching Solr backup metadata from $base_url"
+  latest="$(curl -fsS "$base_url/LATEST" | tr -d '\r\n')"
+  current_latest="$(tr -d '\r\n' < "$SOLRDUMP_DIR/LATEST" 2> /dev/null || :)"
+
+  if [ "$current_latest" != "$latest" ]; then
+    log "Solr cache LATEST differs from upstream; fetching missing current backup files without deleting existing archives"
+  fi
+
+  printf '%s\n' "$latest" > "$SOLRDUMP_DIR/LATEST.part" || return $?
+  mv -f -- "$SOLRDUMP_DIR/LATEST.part" "$SOLRDUMP_DIR/LATEST"
+  curl -fsS "$base_url/$latest/MD5SUMS" -o "$SOLRDUMP_DIR/MD5SUMS.part" || return $?
+  mv -f -- "$SOLRDUMP_DIR/MD5SUMS.part" "$SOLRDUMP_DIR/MD5SUMS"
+
+  while read -r checksum filename; do
+    [ -n "$filename" ] || continue
+
+    if [ -f "$SOLRDUMP_DIR/$filename" ]; then
+      actual="$(md5sum "$SOLRDUMP_DIR/$filename" | awk '{print $1}')"
+      if [ "$actual" = "$checksum" ]; then
+        log "Solr backup $filename already exists and matches checksum"
+        continue
+      fi
+
+      log "Removing Solr backup $filename because checksum changed"
+      rm -f -- "$SOLRDUMP_DIR/$filename"
+    fi
+
+    tmpfile="$SOLRDUMP_DIR/$filename.part"
+    if [ -f "$tmpfile" ]; then
+      log "Resuming Solr backup download $filename"
+    else
+      log "Downloading Solr backup $filename"
+    fi
+    curl -fL --http1.1 --retry 10 --retry-delay 10 --retry-all-errors --continue-at - --output "$tmpfile" "$base_url/$latest/$filename" || return $?
+
+    actual="$(md5sum "$tmpfile" | awk '{print $1}')"
+    if [ "$actual" != "$checksum" ]; then
+      echo "Search backup checksum mismatch for $filename: expected $checksum, got $actual"
+      mv -f -- "$tmpfile" "$tmpfile.bad.$(date +%Y%m%d%H%M%S)"
+      return 1
+    fi
+
+    mv -f -- "$tmpfile" "$SOLRDUMP_DIR/$filename"
+    log "Stored verified Solr backup $filename"
+  done << EOF
+$(
+    python - "$SOLRDUMP_DIR/MD5SUMS" << 'PY'
+import re
+import sys
+
+with open(sys.argv[1], 'r', encoding='utf-8') as fh:
+    for line in fh:
+        m = re.match(r'^([0-9a-fA-F]{32}) \*(.+)$', line.strip())
+        if m:
+            print(m.group(1), m.group(2))
+PY
+  )
+EOF
+
+  failed_files="$(cd "$SOLRDUMP_DIR" && md5sum -c MD5SUMS 2> /dev/null | awk '/: FAILED$/ {print $1}' | sed 's/:$//')"
+
+  if [ -n "$failed_files" ]; then
+    printf 'Search backup MD5 verification failed for:\n%s\n' "$failed_files"
+    return 1
+  fi
+}
+
+bootstrap_search_indexes() {
+  log "Bootstrapping Solr search indexes from backup archives"
+  docker compose stop indexer || :
+
+  # Let the upstream helper own resume and integrity checks. A partial
+  # backup set is not usable, and a filename-only precheck can mistake an
+  # interrupted recording archive download for a complete cache.
+  ensure_host_writable_search_cache
+  log "Repairing local Solr backup cache"
+  repair_search_backup_cache || return $?
+  if ! fetch_search_backup_archives; then
+    if truthy "$MUSICBRAINZ_ALLOW_PARTIAL_SOLR_BOOTSTRAP"; then
+      log "Solr backup cache is incomplete; creating missing collections without restored data because MUSICBRAINZ_ALLOW_PARTIAL_SOLR_BOOTSTRAP=1"
+      ensure_all_search_collections
+      return
+    fi
+
+    return 1
+  fi
+
+  log "Loading Solr backup archives into the search service"
+  docker compose exec -T search load-backup-archives || return $?
+  ensure_search_seed_collections || return $?
+}
+
+ensure_search_automation() {
+  log "Checking RabbitMQ, AMQP triggers, and search indexes"
+  wait_for_mq
+
+  if ! mq_user_exists; then
+    log "RabbitMQ user for SIR is missing; recreating RabbitMQ service"
+    docker compose up -d --no-build --force-recreate mq
+    wait_for_mq
+    if ! mq_user_exists; then
+      log "RabbitMQ user for SIR is still missing after recreate; resetting RabbitMQ state"
+      reset_mq_data
+      mq_user_exists
+    fi
+  else
+    log "RabbitMQ user for SIR already exists"
+  fi
+
+  if ! amqp_extension_enabled; then
+    log "Installing PostgreSQL AMQP extension"
+    docker compose up -d --no-build indexer
+    clean_stale_amqp_extension_files
+    ./admin/create-amqp-extension || return $?
+  else
+    log "PostgreSQL AMQP extension already enabled"
+  fi
+
+  if ! amqp_triggers_installed; then
+    log "Installing AMQP search triggers"
+    docker compose up -d --no-build indexer
+    ./admin/setup-amqp-triggers install || return $?
+  else
+    log "AMQP search triggers already installed"
+  fi
+
+  if search_index_ready; then
+    log "Search indexes already verify successfully"
+  else
+    local bootstrap_status=0
+    bootstrap_search_indexes || bootstrap_status=$?
+    if [ "$bootstrap_status" -ne 0 ] || ! search_index_ready; then
+      log "Search bootstrap did not verify; resetting Solr state and retrying once"
+      reset_search_data || return $?
+      bootstrap_search_indexes || return $?
+    fi
+  fi
+
+  log "Starting SIR indexer and ensuring AMQP setup"
+  docker compose up -d --no-build indexer
+  docker compose exec -T indexer python -m sir amqp_setup
+
+  if ! search_index_ready; then
+    echo "Search index did not become ready after bootstrap"
+    return 1
+  fi
+}
+
+wait_for_cron() {
+  local attempt
+
+  for attempt in $(seq 1 "$SETUP_HTTP_CHECK_RETRIES"); do
+    if cron_enabled; then
+      log "Replication cron is active"
+      return
+    fi
+
+    if [ "$attempt" -eq 1 ] || [ $((attempt % 6)) -eq 0 ]; then
+      log "Still waiting for replication cron ($attempt/$SETUP_HTTP_CHECK_RETRIES)"
+    fi
+    sleep "$SETUP_HTTP_CHECK_DELAY"
+  done
+
+  echo "Replication cron did not become active in the musicbrainz container"
+  return 1
+}
+
+phase_prepare_runtime() {
+  log "Preparing Docker volumes and runtime"
+  ensure_bind_volume dbdump "$DBDUMP_DIR" musicbrainz search
+  ensure_bind_volume solrdump "$SOLRDUMP_DIR" musicbrainz search
+
+  if [ "$USE_HOST_PGDATA" -eq 1 ]; then
+    log "Using host PostgreSQL data at $PGDATA_DIR"
+    ensure_bind_volume pgdata "$PGDATA_DIR" db
+  else
+    log "Using local Docker PostgreSQL data volume"
+    ensure_local_volume pgdata db
+  fi
+
+  if [ "$USE_HOST_MQDATA" -eq 1 ]; then
+    log "Using host RabbitMQ data at $MQDATA_DIR"
+    ensure_bind_volume mqdata "$MQDATA_DIR" mq
+  else
+    log "Using local Docker RabbitMQ data volume"
+    ensure_local_volume mqdata mq
+  fi
+
+  if [ "$USE_HOST_SOLRDATA" -eq 1 ]; then
+    log "Using host Solr data at $SOLRDATA_DIR"
+    ensure_bind_volume solrdata "$SOLRDATA_DIR" search
+  else
+    log "Using local Docker Solr data volume"
+    ensure_local_volume solrdata search
+  fi
+
+  ensure_host_runtime_healthy
+  ensure_images
+  ensure_volume_permissions "$(compose_volume_name solrdump)" '' '' 775
+  ensure_volume_permissions "$(compose_volume_name solrdata)" 8983 8983 775
+  start_core_services
+}
+
+phase_ensure_database() {
+  if db_initialized; then
+    log "Database already initialized; checking whether a schema upgrade is needed"
+    run_database_upgrade_if_needed
+  else
+    log "MusicBrainz database is not initialized; starting import"
+    initialize_db
+  fi
+}
+
+phase_start_application() {
+  log "Starting MusicBrainz web service"
+  docker compose up -d --no-build musicbrainz
+
+  if ! wait_for_cron; then
+    log "Replication cron did not become active; recreating MusicBrainz web service"
+    docker compose up -d --no-build --force-recreate musicbrainz
+    wait_for_cron
+  fi
+}
+
+verify_application_endpoints() {
+  wait_for_http_status "MusicBrainz homepage" "$(musicbrainz_base_url)/"
+  wait_for_artist_lookup
+}
+
+phase_verify_application() {
+  log "Verifying MusicBrainz HTTP endpoints"
+  if ! verify_application_endpoints; then
+    log "Application verification failed; recreating MusicBrainz web service and retrying"
+    docker compose up -d --no-build --force-recreate musicbrainz
+    wait_for_cron
+    verify_application_endpoints
+  fi
+}
+
+phase_ensure_search() {
+  log "Ensuring search automation and indexes"
+  ensure_search_automation
+}
+
+phase_verify_deployment() {
+  log "Running full deployment verification"
+  "$VERIFY_SCRIPT"
+}
+
+main() {
+  run_phase "configure host firewall" ensure_ufw_web_rule
+  run_phase "prepare Docker runtime" phase_prepare_runtime
+  run_phase "ensure database" phase_ensure_database
+  run_phase "start application" phase_start_application
+  run_phase "verify application" phase_verify_application
+  run_phase "ensure search" phase_ensure_search
+  run_phase "verify deployment" phase_verify_deployment
+  log "Setup completed; MusicBrainz services are running in the background"
+  log "Printing final Docker Compose logs snapshot"
+  docker compose logs || :
+}
+
+main "$@"
