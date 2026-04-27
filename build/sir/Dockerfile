@@ -41,8 +41,13 @@ LABEL org.metabrainz.sir.version="${SIR_VERSION}"
 # hadolint ignore=DL3003
 RUN git clone --depth=1 --branch "v${SIR_VERSION}" https://github.com/metabrainz/sir.git /code \
     && cd /code \
-    && pip install -r requirements.txt \
-    && rm -f /code/config.ini \
+    && pip install -r requirements.txt
+
+COPY patch_indexing.py /tmp/patch_indexing.py
+
+RUN python /tmp/patch_indexing.py
+
+RUN rm -f /code/config.ini \
     && touch /etc/consul-template.conf
 
 WORKDIR /code
@@ -54,4 +59,3 @@ ENV MUSICBRAINZ_RABBITMQ_SERVER=mq \
 
 ENV POSTGRES_USER=musicbrainz
 ENV POSTGRES_PASSWORD=musicbrainz
-
