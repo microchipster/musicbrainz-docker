@@ -23,6 +23,7 @@ search and replication in docker.
 * [Advanced configuration](#advanced-configuration)
   - [Local changes](#local-changes)
   - [Docker environment variables](#docker-environment-variables)
+  - [Persistent data layout and backups](#persistent-data-layout-and-backups)
   - [Docker Compose overrides](#docker-compose-overrides)
 * [Test setup](#test-setup)
 * [Development setup](#development-setup)
@@ -417,6 +418,68 @@ Notes:
   - If not transferring data, MusicBrainz user sessions will be reset.
 * The service `valkey` will still be running even if unused.
 
+### Persistent data layout and backups
+
+The `setup-musicbrainz` wrapper stores persistent state on host paths and writes a local Compose override for those paths.
+
+By default, all persistent data lives under:
+
+```text
+${MUSICBRAINZ_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/musicbrainz-docker}
+```
+
+The default subdirectories are:
+
+```text
+dbdump    reusable MusicBrainz base dump cache
+solrdump  reusable Solr backup archive cache
+pgdata    live PostgreSQL data
+mqdata    live RabbitMQ data
+solrdata  live Solr index data
+```
+
+For hosts with both fast and large storage, keep live data on SSD and reusable caches on larger HDD storage:
+
+```bash
+mkdir -p local
+cat > local/setup.env <<'EOF'
+MUSICBRAINZ_DATA_DIR=/srv/musicbrainz-docker
+MUSICBRAINZ_LIVE_DATA_DIR=/srv/musicbrainz-docker
+MUSICBRAINZ_CACHE_DIR=/mnt/large-disk/musicbrainz-docker
+EOF
+chmod 600 local/setup.env
+```
+
+With that split, the directories that matter are:
+
+```text
+${MUSICBRAINZ_LIVE_DATA_DIR}/pgdata    live PostgreSQL data; back this up for fast recovery
+${MUSICBRAINZ_LIVE_DATA_DIR}/mqdata    live RabbitMQ state; small, include with live backups
+${MUSICBRAINZ_LIVE_DATA_DIR}/solrdata  live Solr indexes; can be rebuilt, but backing it up saves time
+${MUSICBRAINZ_CACHE_DIR}/dbdump        base dump cache; keep to avoid re-downloading large dumps
+${MUSICBRAINZ_CACHE_DIR}/solrdump      Solr backup archive cache; keep to avoid re-downloading archives
+local/secrets/                         replication token and local secrets
+local/setup.env                        host-specific storage choices
+```
+
+For a consistent raw PostgreSQL backup, stop services that write to the database before copying `pgdata`:
+
+```bash
+docker compose stop musicbrainz indexer db
+rsync -a --delete "${MUSICBRAINZ_LIVE_DATA_DIR:-${MUSICBRAINZ_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/musicbrainz-docker}}/pgdata/" /backup/musicbrainz/pgdata/
+docker compose up -d db musicbrainz indexer
+```
+
+Alternatively, use a logical PostgreSQL dump while the database is running:
+
+```bash
+docker compose exec -T db pg_dump -U musicbrainz -Fc musicbrainz_db > musicbrainz_db.dump
+```
+
+Also back up the cache directories if you do not want to download the base dumps and Solr backup archives again.
+
+If a Solr backup cache is incomplete, `setup-musicbrainz` fails by default instead of silently starting search from partial data. Operators who accept degraded search bootstrap can set `MUSICBRAINZ_ALLOW_PARTIAL_SOLR_BOOTSTRAP=1`; the wrapper will create any missing Solr collections so the service starts, but collections without restored backup archives may initially be empty until live indexing catches up.
+
 ### Docker Compose overrides
 
 In Docker Compose, it is possible to override the base configuration using
@@ -535,7 +598,9 @@ git clone https://github.com/metabrainz/musicbrainz-server.git
 MUSICBRAINZ_SERVER_LOCAL_ROOT=$PWD/musicbrainz-server
 git clone https://github.com/metabrainz/musicbrainz-docker.git
 cd musicbrainz-docker
-echo MUSICBRAINZ_DOCKER_HOST_IPADDRCOL=127.0.0.1: >> .env
+# For localhost-only access, uncomment the next line.
+# echo MUSICBRAINZ_DOCKER_HOST_IPADDRCOL=127.0.0.1: >> .env
+# For LAN access, leave it unset or set it to the machine's LAN IP.
 echo MUSICBRAINZ_SERVER_LOCAL_ROOT="$MUSICBRAINZ_SERVER_LOCAL_ROOT" >> .env
 admin/configure add musicbrainz-dev
 docker compose build
@@ -551,7 +616,7 @@ The main differences are:
 4. JavaScript and resources are automaticaly recompiled on file changes,
 5. MusicBrainz Server is automatically restarted on Perl file changes,
 6. MusicBrainz Server code is in `musicbrainz-server/` directory.
-7. Ports are published to the host only (through `MUSICBRAINZ_DOCKER_HOST_IPADDRCOL`)
+7. Ports are published only to the address configured by `MUSICBRAINZ_DOCKER_HOST_IPADDRCOL`; leave it unset for all interfaces, or pin it to `127.0.0.1` for localhost-only access.
 
 After changing code in `musicbrainz-server/`, it can be run as follows:
 
