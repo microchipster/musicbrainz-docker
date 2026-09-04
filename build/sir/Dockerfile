@@ -1,11 +1,13 @@
 ARG PYTHON_VERSION=3.13
 ARG BASE_IMAGE_DATE=20260216
-FROM metabrainz/python:$PYTHON_VERSION-$BASE_IMAGE_DATE
+ARG SIR_BASE_IMAGE=metabrainz/python:$PYTHON_VERSION-$BASE_IMAGE_DATE
+FROM ${SIR_BASE_IMAGE}
 
 ARG PYTHON_VERSION
 ARG BASE_IMAGE_DATE
+ARG SIR_BASE_IMAGE
 
-LABEL org.metabrainz.based-on-image="metabrainz/python:${PYTHON_VERSION}-${BASE_IMAGE_DATE}"
+LABEL org.metabrainz.based-on-image="${SIR_BASE_IMAGE}"
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -42,8 +44,13 @@ LABEL org.metabrainz.sir.version="${SIR_VERSION}"
 # hadolint ignore=DL3003
 RUN git clone --depth=1 --branch "$SIR_BRANCH" https://github.com/metabrainz/sir.git /code \
     && cd /code \
-    && pip install -r requirements.txt \
-    && rm -f /code/config.ini \
+    && pip install -r requirements.txt
+
+COPY patch_indexing.py /tmp/patch_indexing.py
+
+RUN python /tmp/patch_indexing.py
+
+RUN rm -f /code/config.ini \
     && touch /etc/consul-template.conf
 
 WORKDIR /code
