@@ -1,0 +1,545 @@
+#!/usr/bin/env bash
+#
+# verify-musicbrainz -- post-deployment verification for musicbrainz-docker.
+#
+# Scopes:
+#   full         Everything below (default).
+#   search       Solr collections exist and are queryable.
+#   replication  Replication sequence staleness, append-only history log, and
+#                an optional probe of the upstream replication packet mirror.
+#   indexing     Live-search indexing health (sir.control.indexing_enabled and
+#                pending-change drain).
+#
+# Exit codes: 0 verified, 1 verification failure, 2 usage error.
+
+TERM="${TERM-'xterm'}"
+export TERM
+gray="$(tput setaf 8 || echo "")"
+reset="$(tput sgr0 || echo "")"
+PS4="${gray-}"'+(${BASH_SOURCE[0]}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'"${reset-}"
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_DIR"
+
+COMPOSE_FILE_DEFAULT="docker-compose.yml:compose/replication-token.yml:compose/replication-cron.yml:compose/live-indexing-search.yml:local/compose/bind-mounts.yml"
+COMPOSE_FILE="${COMPOSE_FILE:-$COMPOSE_FILE_DEFAULT}"
+export COMPOSE_FILE
+
+SCOPE="full"
+QUIET=0
+SKIP_UPSTREAM_CHECK="${VERIFY_SKIP_UPSTREAM_CHECK:-0}"
+SKIP_INDEXING_CHECK="${VERIFY_SKIP_INDEXING_CHECK:-0}"
+MUSICBRAINZ_CANARY_ARTIST_ID="b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d"
+VERIFY_RELEASE_LOOKBACK_DAYS="${VERIFY_RELEASE_LOOKBACK_DAYS:-30}"
+VERIFY_MAX_STALENESS_HOURS="${VERIFY_MAX_STALENESS_HOURS:-30}"
+VERIFY_MAX_LAG_PACKETS="${VERIFY_MAX_LAG_PACKETS:-24}"
+VERIFY_INDEXING_MAX_PENDING_HOURS="${VERIFY_INDEXING_MAX_PENDING_HOURS:-6}"
+VERIFY_INDEXING_PROBE_SECONDS="${VERIFY_INDEXING_PROBE_SECONDS:-90}"
+VERIFY_INDEXING_PROBE_RETRIES="${VERIFY_INDEXING_PROBE_RETRIES:-2}"
+VERIFY_REPLICATION_HISTORY_FILE="${VERIFY_REPLICATION_HISTORY_FILE:-$REPO_DIR/local/state/replication-history.log}"
+EXPECTED_SERVICES=(db valkey search musicbrainz indexer)
+EXPECTED_COLLECTIONS=(annotation area artist cdstub editor event instrument label place recording release release-group series tag url work)
+UPSTREAM_REPLICATION_URI="${VERIFY_UPSTREAM_REPLICATION_URI:-https://metabrainz.org/api/musicbrainz}"
+
+usage() {
+  cat <<EOF
+Usage: $0 [options]
+
+Verify that a musicbrainz-docker deployment is healthy.
+
+Options:
+  --scope SCOPE   One of: full (default), search, replication, indexing.
+  --no-upstream   Skip the upstream replication-packet probe (also honored via
+                  VERIFY_SKIP_UPSTREAM_CHECK=1).
+  --quiet         Print nothing on success.
+  -h, --help      Show this help.
+
+Environment knobs:
+  VERIFY_RELEASE_LOOKBACK_DAYS        Recent-release search window (full; default 30).
+  VERIFY_MAX_STALENESS_HOURS          Fail if the last replicated packet is older
+                                      than this (replication/full; default 30).
+  VERIFY_MAX_LAG_PACKETS              Fail if upstream has published this many more
+                                      packets than we ingested (replication/full;
+                                      default 24).
+  VERIFY_INDEXING_MAX_PENDING_HOURS   Fail if the pending-change backlog shows no
+                                      progress and the last recorded attempt is
+                                      older than this window (indexing/full;
+                                      default 6).
+  VERIFY_INDEXING_PROBE_SECONDS       How long each backlog-drain observation
+                                      window is (indexing/full; default 90).
+  VERIFY_INDEXING_PROBE_RETRIES       How many observation windows must show no
+                                      drain progress before failing (indexing/full;
+                                      default 2).
+  VERIFY_REPLICATION_HISTORY_FILE     Append-only replication history log
+                                      (default local/state/replication-history.log).
+  VERIFY_SKIP_UPSTREAM_CHECK=1        Same as --no-upstream.
+  VERIFY_SKIP_INDEXING_CHECK=1        Skip live-indexing checks (full scope only).
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --scope)
+      [ "$#" -ge 2 ] || {
+        echo "Missing value for --scope" >&2
+        exit 2
+      }
+      SCOPE="$2"
+      shift 2
+      ;;
+    --no-upstream)
+      SKIP_UPSTREAM_CHECK=1
+      shift
+      ;;
+    --quiet)
+      QUIET=1
+      shift
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      echo "Try '$0 --help' for usage." >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "$SCOPE" in
+  full|search|replication|indexing) ;;
+  *)
+    echo "Unknown scope: $SCOPE (expected full, search, replication, or indexing)" >&2
+    exit 2
+    ;;
+esac
+
+if [ "$SCOPE" = "full" ] || [ "$SCOPE" = "search" ]; then
+  case "$VERIFY_RELEASE_LOOKBACK_DAYS" in
+    ''|*[!0-9]*|0)
+      echo "VERIFY_RELEASE_LOOKBACK_DAYS must be a positive integer: $VERIFY_RELEASE_LOOKBACK_DAYS" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+if [ "$SCOPE" = "full" ] || [ "$SCOPE" = "replication" ]; then
+  case "$VERIFY_MAX_STALENESS_HOURS" in
+    ''|*[!0-9]*|0)
+      echo "VERIFY_MAX_STALENESS_HOURS must be a positive integer: $VERIFY_MAX_STALENESS_HOURS" >&2
+      exit 2
+      ;;
+  esac
+  case "$VERIFY_MAX_LAG_PACKETS" in
+    ''|*[!0-9]*|0)
+      echo "VERIFY_MAX_LAG_PACKETS must be a positive integer: $VERIFY_MAX_LAG_PACKETS" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+if [ "$SCOPE" = "full" ] || [ "$SCOPE" = "indexing" ]; then
+  case "$VERIFY_INDEXING_MAX_PENDING_HOURS" in
+    ''|*[!0-9]*)
+      echo "VERIFY_INDEXING_MAX_PENDING_HOURS must be a non-negative integer: $VERIFY_INDEXING_MAX_PENDING_HOURS" >&2
+      exit 2
+      ;;
+  esac
+  for knob in "$VERIFY_INDEXING_PROBE_SECONDS" "$VERIFY_INDEXING_PROBE_RETRIES"; do
+    case "$knob" in
+      ''|*[!0-9]*)
+        echo "VERIFY_INDEXING_PROBE_SECONDS and VERIFY_INDEXING_PROBE_RETRIES must be non-negative integers: $knob" >&2
+        exit 2
+        ;;
+    esac
+  done
+  if [ "$VERIFY_INDEXING_PROBE_RETRIES" -eq 0 ]; then
+    echo "VERIFY_INDEXING_PROBE_RETRIES must be at least 1" >&2
+    exit 2
+  fi
+fi
+
+log() {
+  [ "$QUIET" -eq 1 ] || printf '%s\n' "$1"
+}
+
+human_duration() {
+  local total_seconds="$1"
+  local days hours minutes
+
+  if [ "$total_seconds" -lt 0 ]; then
+    total_seconds=0
+  fi
+
+  days=$((total_seconds / 86400))
+  hours=$(((total_seconds % 86400) / 3600))
+  minutes=$(((total_seconds % 3600) / 60))
+
+  if [ "$days" -gt 0 ]; then
+    printf '%dd %dh %dm' "$days" "$hours" "$minutes"
+  elif [ "$hours" -gt 0 ]; then
+    printf '%dh %dm' "$hours" "$minutes"
+  else
+    printf '%dm' "$minutes"
+  fi
+}
+
+utc_days_ago_date() {
+  local days
+
+  days="$1"
+
+  if date --version >/dev/null 2>&1; then
+    date -u -d "$days days ago" +%F
+  else
+    date -u -v-"${days}d" +%F
+  fi
+}
+
+musicbrainz_base_url() {
+  printf 'http://%s:%s' "${MUSICBRAINZ_WEB_SERVER_HOST:-localhost}" "${MUSICBRAINZ_WEB_SERVER_PORT:-5000}"
+}
+
+db_psql() {
+  docker compose exec -T db psql -U musicbrainz -d musicbrainz_db -At -F $'\t' "$@"
+}
+
+require_running_services() {
+  local running
+  local service
+
+  running="$(docker compose ps --services --status running)"
+  for service in "${EXPECTED_SERVICES[@]}"; do
+    printf '%s\n' "$running" | grep -qx "$service" || {
+      echo "Service is not running: $service" >&2
+      return 1
+    }
+  done
+}
+
+require_replication_cron() {
+  docker compose exec -T musicbrainz crontab -l 2> /dev/null | grep -q "replication.sh" || {
+    echo "Replication cron is not installed in the musicbrainz container" >&2
+    return 1
+  }
+}
+
+# curl -f exits with terse codes (22 for HTTP errors) that errexit would
+# propagate verbatim; wrap it so failures are reported with the request.
+http_get() {
+  local output
+  local rc=0
+  output="$(curl -fsS "$@")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "HTTP request failed (curl exit $rc): $*" >&2
+    return 1
+  fi
+  printf '%s' "$output"
+}
+
+require_homepage() {
+  local url
+  url="$(musicbrainz_base_url)/"
+  http_get -o /dev/null "$url"
+  log "Verified homepage: $url"
+}
+
+require_artist_lookup() {
+  local url
+  local response
+  url="$(musicbrainz_base_url)/ws/2/artist/$MUSICBRAINZ_CANARY_ARTIST_ID?fmt=json"
+  response="$(http_get "$url")"
+  printf '%s' "$response" | jq -e --arg id "$MUSICBRAINZ_CANARY_ARTIST_ID" '.id == $id' > /dev/null
+  log "Verified artist lookup: $url"
+}
+
+require_artist_search() {
+  local url
+  local response
+  url="$(musicbrainz_base_url)/ws/2/artist?query=arid:$MUSICBRAINZ_CANARY_ARTIST_ID&fmt=json"
+  response="$(http_get "$url")"
+  printf '%s' "$response" | jq -e --arg id "$MUSICBRAINZ_CANARY_ARTIST_ID" '.artists | any(.id == $id)' > /dev/null || {
+    echo "Search did not return canary artist: $url" >&2
+    return 1
+  }
+  log "Verified artist search: $url"
+}
+
+require_recent_release_lookup() {
+  local cutoff
+  local search_url
+  local release_id
+  local release_title
+  local release_date
+  local lookup_url
+  local response
+
+  cutoff="$(utc_days_ago_date "$VERIFY_RELEASE_LOOKBACK_DAYS")"
+  search_url="$(musicbrainz_base_url)/ws/2/release/"
+  response="$(http_get --get \
+    --data-urlencode "query=date:[${cutoff} TO *]" \
+    --data-urlencode "fmt=json" \
+    --data-urlencode "limit=1" \
+    "$search_url")"
+
+  release_id="$(printf '%s' "$response" | jq -r '.releases[0].id // empty')"
+  release_title="$(printf '%s' "$response" | jq -r '.releases[0].title // empty')"
+  release_date="$(printf '%s' "$response" | jq -r '.releases[0].date // empty')"
+
+  if [ -z "$release_id" ] || [ -z "$release_title" ]; then
+    echo "Did not find any recent releases from the last ${VERIFY_RELEASE_LOOKBACK_DAYS} days: $search_url" >&2
+    return 1
+  fi
+
+  lookup_url="$(musicbrainz_base_url)/ws/2/release/$release_id?fmt=json"
+  response="$(http_get "$lookup_url")"
+  printf '%s' "$response" | jq -e --arg id "$release_id" '.id == $id' > /dev/null || {
+    echo "Lookup did not return the expected release: $lookup_url" >&2
+    return 1
+  }
+
+  log "Verified recent release search and lookup: ${release_title} (${release_date:-unknown})"
+}
+
+require_search_collections() {
+  local collections_json
+  local collection
+
+  collections_json="$(docker compose exec -T search sh -lc "curl -fsS 'http://localhost:8983/solr/admin/collections?action=LIST&wt=json'")"
+  for collection in "${EXPECTED_COLLECTIONS[@]}"; do
+    printf '%s' "$collections_json" | jq -e --arg name "$collection" '.collections | index($name) != null' > /dev/null || {
+      echo "Solr collection missing: $collection" >&2
+      return 1
+    }
+  done
+}
+
+require_search_queries() {
+  # The MusicBrainz /select handler pins defType=dismax, so a bare "*:*"
+  # parses as term matches over the qf fields and returns 0 (or a handler
+  # NPE on some configsets) regardless of index contents. /admin/ping is
+  # defined in every collection's configset and reflects real health: 200
+  # when the core is serving, 404 when the collection is missing, 500
+  # while it is still recovering. Data presence is asserted separately by
+  # the full-scope artist search, which exercises the real dismax query
+  # path end to end.
+  local collection
+  local response
+
+  for collection in "${EXPECTED_COLLECTIONS[@]}"; do
+    response="$(docker compose exec -T search sh -lc "curl -fsS 'http://localhost:8983/solr/$collection/admin/ping?wt=json'")"
+    printf '%s' "$response" | jq -e '.status == "OK"' > /dev/null || {
+      echo "Solr collection is not queryable: $collection" >&2
+      return 1
+    }
+  done
+}
+
+replication_current_state() {
+  db_psql -c "
+    SELECT
+      current_replication_sequence,
+      EXTRACT(EPOCH FROM last_replication_date)::bigint,
+      to_char(last_replication_date AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+    FROM musicbrainz.replication_control
+    ORDER BY id DESC
+    LIMIT 1;
+  " 2> /dev/null
+}
+
+replication_upstream_probe() {
+  local sequence="$1"
+  local probe_sequence
+  local token
+  local http_code
+
+  token="$(docker compose exec -T musicbrainz cat /run/secrets/metabrainz_access_token 2> /dev/null | tr -d '[:space:]')"
+  if [ -z "$token" ]; then
+    log "Upstream probe skipped: replication token is not available in the musicbrainz container"
+    return 0
+  fi
+
+  probe_sequence=$((sequence + VERIFY_MAX_LAG_PACKETS))
+  http_code="$(docker compose exec -T musicbrainz curl -sS -I -o /dev/null -w '%{http_code}' \
+    --connect-timeout 10 --max-time 30 \
+    "${UPSTREAM_REPLICATION_URI}/replication-${probe_sequence}-v2.tar.bz2?token=${token}" 2> /dev/null || true)"
+
+  case "$http_code" in
+    200)
+      echo "Replication is behind upstream by more than ${VERIFY_MAX_LAG_PACKETS} packets (packet ${probe_sequence} already exists upstream; local sequence is ${sequence})" >&2
+      return 1
+      ;;
+    404)
+      log "Upstream probe OK: packet ${probe_sequence} is not published yet (local sequence ${sequence} is within ${VERIFY_MAX_LAG_PACKETS} packets of upstream)"
+      ;;
+    *)
+      log "Upstream probe inconclusive: packet ${probe_sequence} probe returned '${http_code:-no response}'"
+      ;;
+  esac
+}
+
+check_replication() {
+  local state
+  local sequence replication_epoch replication_iso
+  local now_epoch age_seconds staleness_seconds
+  local history_file history_last history_last_sequence history_last_replication_epoch
+
+  state="$(replication_current_state)"
+  if [ -z "$state" ]; then
+    echo "Could not query musicbrainz.replication_control from the db service" >&2
+    return 1
+  fi
+
+  IFS=$'\t' read -r sequence replication_epoch replication_iso <<< "$state"
+  if [ -z "${sequence:-}" ] || [ -z "${replication_epoch:-}" ] || [ -z "${replication_iso:-}" ]; then
+    echo "Incomplete replication state returned from musicbrainz.replication_control: $state" >&2
+    return 1
+  fi
+
+  now_epoch="$(date +%s)"
+  age_seconds=$((now_epoch - replication_epoch))
+  staleness_seconds=$((VERIFY_MAX_STALENESS_HOURS * 3600))
+
+  if [ "$age_seconds" -gt "$staleness_seconds" ]; then
+    echo "Replication is stale: last packet ingested ${replication_iso} ($(human_duration "$age_seconds") ago), exceeding the ${VERIFY_MAX_STALENESS_HOURS}h window" >&2
+    return 1
+  fi
+  log "Replication sequence ${sequence} ingested at ${replication_iso} (age $(human_duration "$age_seconds"), window ${VERIFY_MAX_STALENESS_HOURS}h)"
+
+  history_file="$VERIFY_REPLICATION_HISTORY_FILE"
+  mkdir -p "$(dirname "$history_file")"
+  history_last=""
+  [ -f "$history_file" ] && history_last="$(tail -n 1 "$history_file" 2> /dev/null || true)"
+  history_last_checked_epoch=0
+  history_last_sequence=0
+  history_last_replication_epoch=0
+  if [ -n "$history_last" ]; then
+    IFS=$'\t' read -r history_last_checked_epoch history_last_sequence history_last_replication_epoch _ <<< "$history_last"
+    history_last_checked_epoch="${history_last_checked_epoch:-0}"
+    history_last_sequence="${history_last_sequence:-0}"
+    history_last_replication_epoch="${history_last_replication_epoch:-0}"
+  fi
+
+  printf '%s\t%s\t%s\t%s\n' "$now_epoch" "$sequence" "$replication_epoch" "$replication_iso" >> "$history_file"
+
+  if [ -z "$history_last_sequence" ] || [ "$history_last_sequence" = "0" ]; then
+    log "Replication history started at ${history_file}: sequence ${sequence}, ingested ${replication_iso}"
+  elif [ "$sequence" -gt "$history_last_sequence" ] || [ "$replication_epoch" -gt "$history_last_replication_epoch" ]; then
+    log "Replication advanced by $((sequence - history_last_sequence)) packet(s) since the last recorded check (${history_last_sequence} -> ${sequence})"
+  else
+    log "No new replication packets since the last recorded check (still at sequence ${sequence} from ${replication_iso}, recorded $(human_duration "$((now_epoch - history_last_checked_epoch))") ago)"
+  fi
+
+  if [ "$SKIP_UPSTREAM_CHECK" != "1" ]; then
+    replication_upstream_probe "$sequence"
+  else
+    log "Upstream probe skipped (VERIFY_SKIP_UPSTREAM_CHECK=1)"
+  fi
+}
+
+check_live_indexing() {
+  local enabled
+  local summary backlog_count stuck_count processable_count last_epoch
+  local now_epoch idle_seconds probe_count
+
+  enabled="$(db_psql -c "SELECT indexing_enabled FROM sir.control;" 2> /dev/null || true)"
+  if [ "$enabled" != "t" ]; then
+    echo "Live indexing is disabled: sir.control.indexing_enabled is '${enabled:-unknown}' (expected true)" >&2
+    return 1
+  fi
+
+  summary="$(db_psql -c "
+    SELECT
+      count(*),
+      count(*) FILTER (WHERE attempts >= 4),
+      count(*) FILTER (WHERE attempts < 4),
+      COALESCE(EXTRACT(EPOCH FROM MAX(last_attempted))::bigint, 0)
+    FROM sir.pending_data;
+  " 2> /dev/null || true)"
+
+  if [ -z "$summary" ]; then
+    echo "Live indexing check failed: could not read sir.pending_data" >&2
+    return 1
+  fi
+
+  IFS=$'\t' read -r backlog_count stuck_count processable_count last_epoch <<< "$summary"
+
+  if [ "${backlog_count:-0}" -eq 0 ]; then
+    log "Live indexing enabled and pending-change backlog is empty"
+    return 0
+  fi
+
+  if [ "${processable_count:-0}" -eq 0 ]; then
+    echo "Live indexing cannot make progress: all ${backlog_count} pending change(s) exhausted their retry attempts" >&2
+    return 1
+  fi
+
+  if [ "${stuck_count:-0}" -gt 0 ]; then
+    echo "Live indexing warning: ${stuck_count} pending change(s) exhausted their retry attempts (processable backlog: ${processable_count})" >&2
+  fi
+
+  # last_attempted is only written for failed rows (successful rows are
+  # deleted), so liveness is proven by watching the processable backlog
+  # shrink. A single batch can take minutes on a cold cache, so probe
+  # repeatedly before concluding the poller is stalled.
+  probe_count="$processable_count"
+  for _ in $(seq 1 "$VERIFY_INDEXING_PROBE_RETRIES"); do
+    sleep "$VERIFY_INDEXING_PROBE_SECONDS"
+    probe_count="$(db_psql -c "SELECT count(*) FILTER (WHERE attempts < 4) FROM sir.pending_data;" 2> /dev/null || true)"
+    [ -n "$probe_count" ] || probe_count="$processable_count"
+    if [ "$probe_count" -lt "$processable_count" ]; then
+      log "Live indexing enabled and draining (processable backlog: ${processable_count} -> ${probe_count})"
+      return 0
+    fi
+  done
+
+  now_epoch="$(date +%s)"
+  idle_seconds=$((now_epoch - last_epoch))
+
+  if [ "${last_epoch:-0}" -eq 0 ]; then
+    echo "Live indexing is stalled: processable backlog of ${processable_count} pending change(s) did not shrink during $((VERIFY_INDEXING_PROBE_SECONDS * VERIFY_INDEXING_PROBE_RETRIES))s of probing and no row has ever been attempted" >&2
+    return 1
+  fi
+
+  if [ "$idle_seconds" -gt "$((VERIFY_INDEXING_MAX_PENDING_HOURS * 3600))" ]; then
+    echo "Live indexing is stalled: processable backlog of ${processable_count} pending change(s) shows no progress, and the last recorded attempt was $(human_duration "$idle_seconds") ago, exceeding the ${VERIFY_INDEXING_MAX_PENDING_HOURS}h window" >&2
+    return 1
+  fi
+
+  echo "Live indexing warning: processable backlog of ${processable_count} pending change(s) did not shrink during the probe; last recorded activity $(human_duration "$idle_seconds") ago" >&2
+}
+
+case "$SCOPE" in
+  full)
+    require_running_services
+    require_replication_cron
+    require_homepage
+    require_artist_lookup
+    require_recent_release_lookup
+    require_search_collections
+    require_search_queries
+    require_artist_search
+    check_replication
+    if [ "$SKIP_INDEXING_CHECK" = "1" ]; then
+      log "Live-indexing check skipped (VERIFY_SKIP_INDEXING_CHECK=1)"
+    else
+      check_live_indexing
+    fi
+    log "Verified full deployment state"
+    ;;
+  search)
+    require_search_collections
+    require_search_queries
+    log "Verified search collections"
+    ;;
+  replication)
+    check_replication
+    log "Verified replication"
+    ;;
+  indexing)
+    check_live_indexing
+    log "Verified live indexing"
+    ;;
+esac
