@@ -1,0 +1,8 @@
+[Unit]
+Description=MusicBrainz Docker self-healing check
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO_DIR@
+ExecStart=@REPO_DIR@/scripts/self-heal.sh
