@@ -14,11 +14,20 @@ PGDATA_OLD="$PGHOME"/16/docker
 PGDATA_NEW="$PGHOME"/18/docker
 PGBIN_OLD=/usr/lib/postgresql/16/bin
 PGBIN_NEW=/usr/lib/postgresql/18/bin
+PGAMQP_DIR=/tmp/pg_amqp
 
 cd "$PGHOME"
-mkdir -p 16/docker
-chmod 700 16 16/docker
-mv -- !(16) 16/docker/
+
+if [ -s "$PGDATA_OLD/PG_VERSION" ]; then
+    echo "$(date) : Old cluster already staged at $PGDATA_OLD"
+elif [ -s "$PGHOME/PG_VERSION" ]; then
+    mkdir -p 16/docker
+    chmod 700 16 16/docker
+    mv -- !(16) 16/docker/
+else
+    echo "$(date) : No old cluster found at $PGHOME"
+    exit 1
+fi
 
 mkdir -p 18/docker
 chmod 700 18 18/docker
@@ -72,9 +81,32 @@ apt-get install \
     postgresql-server-dev-18
 
 # Data checksums are now enabled by default in v18, so we have to enable them
-# in the old cluster before running `pg_upgrade`.
-echo "$(date) : Enabling checksums in the old cluster"
-sudo -u postgres $PGBIN_OLD/pg_checksums --pgdata="$PGDATA_OLD" --enable
+# in the old cluster before running `pg_upgrade` when they are not already on.
+ensure_old_cluster_cleanly_shutdown() {
+    if "$PGBIN_OLD"/pg_controldata "$PGDATA_OLD" | grep -Eq '^Database cluster state:[[:space:]]+shut down( in recovery)?$'; then
+        echo "$(date) : Old cluster is already shut down cleanly"
+        return 0
+    fi
+
+    if [ -f "$PGDATA_OLD/postmaster.pid" ]; then
+        echo "$(date) : Removing stale postmaster.pid before clean shutdown"
+        rm -f "$PGDATA_OLD/postmaster.pid"
+    fi
+
+    echo "$(date) : Starting old cluster briefly to shut it down cleanly"
+    sudo -u postgres "$PGBIN_OLD"/pg_ctl -D "$PGDATA_OLD" start -w
+    echo "$(date) : Stopping old cluster cleanly"
+    sudo -u postgres "$PGBIN_OLD"/pg_ctl -D "$PGDATA_OLD" stop -m fast -w
+}
+
+ensure_old_cluster_cleanly_shutdown
+
+if "$PGBIN_OLD"/pg_controldata "$PGDATA_OLD" | grep -Eq '^Data page checksum version:[[:space:]]+1$'; then
+    echo "$(date) : Checksums already enabled in the old cluster"
+else
+    echo "$(date) : Enabling checksums in the old cluster"
+    sudo -u postgres $PGBIN_OLD/pg_checksums --pgdata="$PGDATA_OLD" --enable
+fi
 
 echo "$(date) : Initializing the new cluster"
 sudo -u postgres $PGBIN_NEW/initdb \
@@ -82,6 +114,16 @@ sudo -u postgres $PGBIN_NEW/initdb \
     --encoding UTF8 \
     --locale en_US.UTF-8 \
     --username musicbrainz
+
+echo "$(date) : Installing pg_amqp in the new cluster"
+PG_AMQP_GIT_REF="51497ac687f16989adff7729a303f9258706f663"
+git clone https://github.com/mwiencek/pg_amqp.git "$PGAMQP_DIR"
+cd "$PGAMQP_DIR"
+git -c advice.detachedHead=false checkout "$PG_AMQP_GIT_REF"
+make PG_CONFIG=$PGBIN_NEW/pg_config PG_CPPFLAGS=-Wno-error=implicit-int \
+    > make.log 2>&1 || { cat make.log >&2; exit 1; }
+make install
+cd "$PGHOME"
 
 echo "$(date) : Running the upgrade"
 sudo -E -u postgres $PGBIN_NEW/pg_upgrade \

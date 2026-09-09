@@ -6,3 +6,4 @@ services:
       context: build/musicbrainz
       args:
         - POSTGRES_VERSION=${POSTGRES_VERSION:-16}
+        - MUSICBRAINZ_BASE_IMAGE

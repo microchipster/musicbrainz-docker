@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: deploy-musicbrainz <target-hostname> <target-dir> <replication-token> <data-dir>
+
+Synchronize this repository to <target-hostname>:<target-dir> and run
+./setup-musicbrainz on the target from that directory.
+
+The target directory should be the repository checkout path on the target host.
+The data directory is the existing host path that stores caches and live data.
+This sync mirrors the source checkout on the target host and removes files
+that no longer exist in the repository, while still excluding host data,
+caches, and local secrets.
+Set MUSICBRAINZ_ALLOW_POSTGRES_MIGRATION=1 to permit an in-place PostgreSQL
+16 -> 18 migration on the target host when legacy data is detected.
+Deployment knobs set in the calling environment (MUSICBRAINZ_ALLOW_BASE_DOWNLOADS,
+MUSICBRAINZ_ALLOW_SOLR_DOWNLOADS, MUSICBRAINZ_ALLOW_PARTIAL_SOLR_BOOTSTRAP,
+MUSICBRAINZ_ALLOW_POSTGRES_MIGRATION, MUSICBRAINZ_USE_HOST_LIVE_DATA,
+MUSICBRAINZ_CONVERT_LOCAL_VOLUMES, MUSICBRAINZ_DISABLE_LIVE_INDEXING)
+are forwarded to setup-musicbrainz on the target host.
+EOF
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  usage
+  exit 0
+fi
+
+if [ "$#" -ne 4 ]; then
+  usage >&2
+  exit 64
+fi
+
+target_host="$1"
+target_dir_input="$2"
+replication_token="$3"
+data_dir="$4"
+source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+remote_home="$(ssh "$target_host" 'printf %s "$HOME"')"
+case "$target_dir_input" in
+  ~) remote_target_dir="$remote_home" ;;
+  ~/*) remote_target_dir="$remote_home/${target_dir_input#~/}" ;;
+  *) remote_target_dir="$target_dir_input" ;;
+esac
+
+remote_target_dir="${remote_target_dir%/}"
+data_dir="${data_dir%/}"
+
+case "$remote_target_dir" in
+  "$data_dir"|"$data_dir"/*)
+    echo "ERROR: target checkout dir must be separate from the data dir" >&2
+    echo "Use a code checkout path like ~/musicbrainz-docker and keep data at $data_dir" >&2
+    exit 64
+    ;;
+esac
+
+case "$data_dir" in
+  "$remote_target_dir"|"$remote_target_dir"/*)
+    echo "ERROR: data dir must be separate from the target checkout dir" >&2
+    echo "Use a data path like /media/cloud_storage/musicbrainz and keep code elsewhere" >&2
+    exit 64
+    ;;
+esac
+
+remote_quoted_target_dir="$(printf '%q' "$remote_target_dir")"
+ssh "$target_host" "mkdir -p $remote_quoted_target_dir"
+
+remote_target_spec="$target_host:$remote_quoted_target_dir/"
+rsync -a --delete \
+  --exclude='.git/' \
+  --exclude='PR.md' \
+  --exclude='local/' \
+  --exclude='dbdump/' \
+  --exclude='solrdump/' \
+  --exclude='pgdata/' \
+  --exclude='mqdata/' \
+  --exclude='solrdata/' \
+  "$source_dir"/ "$remote_target_spec"
+
+remote_quoted_token="$(printf '%q' "$replication_token")"
+remote_quoted_data_dir="$(printf '%q' "$data_dir")"
+forwarded_env=''
+for env_var in \
+  MUSICBRAINZ_ALLOW_BASE_DOWNLOADS \
+  MUSICBRAINZ_ALLOW_SOLR_DOWNLOADS \
+  MUSICBRAINZ_ALLOW_PARTIAL_SOLR_BOOTSTRAP \
+  MUSICBRAINZ_ALLOW_POSTGRES_MIGRATION \
+  MUSICBRAINZ_USE_HOST_LIVE_DATA \
+  MUSICBRAINZ_CONVERT_LOCAL_VOLUMES \
+  MUSICBRAINZ_DISABLE_LIVE_INDEXING
+do
+  if [ -n "${!env_var+x}" ]; then
+    forwarded_env+="$env_var=$(printf '%q' "${!env_var}") "
+  fi
+done
+ssh "$target_host" "cd $remote_quoted_target_dir && ${forwarded_env}./setup-musicbrainz $remote_quoted_token $remote_quoted_data_dir"
