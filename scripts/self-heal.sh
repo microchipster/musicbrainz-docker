@@ -29,10 +29,22 @@ VERIFY_LOG="$STATE_DIR/self-heal-verify.log"
 TIER2_AFTER_FAILURES="${MUSICBRAINZ_SELFHEAL_TIER2_AFTER_FAILURES:-3}"
 TIER1_MAX_WAIT="${MUSICBRAINZ_SELFHEAL_TIER1_MAX_WAIT:-14400}"
 
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$(basename "$REPO_DIR")}"
+
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
 
 solrdata_dir() {
-  docker volume inspect -f '{{ index .Options "device" }}' musicbrainz-docker_solrdata 2> /dev/null
+  docker volume inspect -f '{{ index .Options "device" }}' "${COMPOSE_PROJECT_NAME}_solrdata" 2> /dev/null
+}
+
+data_dir() {
+  local recorded
+  recorded="$(cat "$STATE_DIR/data-dir" 2> /dev/null)"
+  if [ -n "$recorded" ] && [ -d "$recorded" ]; then
+    printf '%s\n' "$recorded"
+  else
+    printf '%s\n' "$(dirname "$(realpath -m "$(solrdata_dir)")")"
+  fi
 }
 
 pause_indexer() { docker compose stop indexer > /dev/null 2>&1 || :; }
@@ -125,7 +137,7 @@ tier2_rebuild_search() {
   fi
 
   log "Tier 2: running ./setup-musicbrainz to rebuild and verify search"
-  if ./setup-musicbrainz "$token" "$(dirname "$wipe_dir")" >> "$LOG_FILE" 2>&1; then
+  if ./setup-musicbrainz "$token" "$(data_dir)" >> "$LOG_FILE" 2>&1; then
     log "Tier 2: rebuild completed and verified"
     printf '0\n' > "$FAIL_COUNTER"
   else
