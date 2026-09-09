@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# shellcheck source=admin/lib/common.inc.bash
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.inc.bash"
+
+HELP=$(cat <<EOH
+Usage: $SCRIPT_NAME [option]
+
+Report whether MusicBrainz replication has ingested new data since the last
+check. The script stores the last observed replication state in a local state
+file and compares the current database replication sequence against it.
+
+Options:
+  --state-file PATH         Override the state file path.
+  --max-staleness-hours N   Warn if replication has not advanced and the latest
+                            replicated data is older than N hours. Default: 36
+  --reset                   Replace the stored baseline with the current state.
+  -h, --help                Print this help message.
+
+Exit codes:
+  0  Replication advanced since the last check, or has not advanced yet but the
+     latest replicated data is still within the staleness window.
+  1  Replication has not advanced and the latest replicated data is stale.
+  2  The current replication state could not be determined.
+
+Examples:
+  $SCRIPT_NAME
+  $SCRIPT_NAME --max-staleness-hours 48
+  $SCRIPT_NAME --reset
+EOH
+)
+
+STATE_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/musicbrainz-docker/replication-progress.state"
+MAX_STALENESS_HOURS=36
+RESET_STATE=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --state-file)
+      [ $# -ge 2 ] || {
+        echo >&2 "$SCRIPT_NAME: missing value for $1"
+        exit 64
+      }
+      STATE_FILE="$2"
+      shift 2
+      ;;
+    --max-staleness-hours)
+      [ $# -ge 2 ] || {
+        echo >&2 "$SCRIPT_NAME: missing value for $1"
+        exit 64
+      }
+      MAX_STALENESS_HOURS="$2"
+      shift 2
+      ;;
+    --reset)
+      RESET_STATE=1
+      shift
+      ;;
+    -h|--help|help)
+      echo "$HELP"
+      exit 0
+      ;;
+    *)
+      echo >&2 "$SCRIPT_NAME: unrecognized argument: '$1'"
+      echo >&2 "Try '$SCRIPT_NAME --help' for usage."
+      exit 64
+      ;;
+  esac
+done
+
+case "$MAX_STALENESS_HOURS" in
+  ''|*[!0-9]*)
+    echo >&2 "$SCRIPT_NAME: --max-staleness-hours must be a non-negative integer"
+    exit 64
+    ;;
+esac
+
+query_replication_state() {
+  $DOCKER_COMPOSE_CMD exec -T db \
+    psql -U musicbrainz -d musicbrainz_db -AtF $'\t' -c "
+      SELECT
+        current_replication_sequence,
+        EXTRACT(EPOCH FROM last_replication_date)::bigint,
+        to_char(last_replication_date AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+      FROM musicbrainz.replication_control
+      ORDER BY id DESC
+      LIMIT 1;
+    " 2> /dev/null
+}
+
+write_state() {
+  local sequence="$1"
+  local replication_epoch="$2"
+  local replication_iso="$3"
+  local checked_epoch="$4"
+
+  mkdir -p "$(dirname "$STATE_FILE")"
+  cat > "$STATE_FILE" <<EOF
+SEQUENCE=$sequence
+REPLICATION_EPOCH=$replication_epoch
+REPLICATION_ISO=$replication_iso
+CHECKED_EPOCH=$checked_epoch
+EOF
+}
+
+human_duration() {
+  local total_seconds="$1"
+  local days hours minutes
+
+  if [ "$total_seconds" -lt 0 ]; then
+    total_seconds=0
+  fi
+
+  days=$((total_seconds / 86400))
+  hours=$(((total_seconds % 86400) / 3600))
+  minutes=$(((total_seconds % 3600) / 60))
+
+  if [ "$days" -gt 0 ]; then
+    printf '%dd %dh %dm' "$days" "$hours" "$minutes"
+  elif [ "$hours" -gt 0 ]; then
+    printf '%dh %dm' "$hours" "$minutes"
+  else
+    printf '%dm' "$minutes"
+  fi
+}
+
+current_state="$(query_replication_state || :)"
+if [ -z "$current_state" ]; then
+  echo "ERROR: could not query musicbrainz.replication_control from the db service" >&2
+  exit 2
+fi
+
+IFS=$'\t' read -r current_sequence current_replication_epoch current_replication_iso <<< "$current_state"
+
+if [ -z "$current_sequence" ] || [ -z "$current_replication_epoch" ] || [ -z "$current_replication_iso" ]; then
+  echo "ERROR: incomplete replication state returned from musicbrainz.replication_control" >&2
+  exit 2
+fi
+
+now_epoch="$(date +%s)"
+current_age_seconds=$((now_epoch - current_replication_epoch))
+staleness_seconds=$((MAX_STALENESS_HOURS * 3600))
+
+if [ "$RESET_STATE" -eq 1 ] || [ ! -f "$STATE_FILE" ]; then
+  write_state "$current_sequence" "$current_replication_epoch" "$current_replication_iso" "$now_epoch"
+  if [ "$RESET_STATE" -eq 1 ]; then
+    echo "OK: reset replication baseline to sequence $current_sequence at $current_replication_iso (age $(human_duration "$current_age_seconds"))."
+  else
+    echo "OK: initialized replication baseline at sequence $current_sequence, replicated at $current_replication_iso (age $(human_duration "$current_age_seconds"))."
+  fi
+  exit 0
+fi
+
+# shellcheck disable=SC1090
+source "$STATE_FILE"
+
+previous_sequence="${SEQUENCE:-}"
+previous_replication_epoch="${REPLICATION_EPOCH:-}"
+previous_replication_iso="${REPLICATION_ISO:-}"
+
+if [ -z "$previous_sequence" ] || [ -z "$previous_replication_epoch" ] || [ -z "$previous_replication_iso" ]; then
+  echo "ERROR: state file '$STATE_FILE' is invalid; rerun with --reset" >&2
+  exit 2
+fi
+
+if [ "$current_sequence" -gt "$previous_sequence" ] || [ "$current_replication_epoch" -gt "$previous_replication_epoch" ]; then
+  write_state "$current_sequence" "$current_replication_epoch" "$current_replication_iso" "$now_epoch"
+  echo "OK: replication advanced by $((current_sequence - previous_sequence)) packet(s) since the last check ($previous_sequence -> $current_sequence); latest replicated data is $current_replication_iso (age $(human_duration "$current_age_seconds"))."
+  exit 0
+fi
+
+write_state "$current_sequence" "$current_replication_epoch" "$current_replication_iso" "$now_epoch"
+
+if [ "$current_age_seconds" -gt "$staleness_seconds" ]; then
+  echo "WARN: replication has not advanced since the last check (still at sequence $current_sequence from $current_replication_iso, age $(human_duration "$current_age_seconds")); exceeds ${MAX_STALENESS_HOURS}h staleness window."
+  exit 1
+fi
+
+echo "OK: no new replication packets since the last check (still at sequence $current_sequence from $current_replication_iso, age $(human_duration "$current_age_seconds")); still within the ${MAX_STALENESS_HOURS}h staleness window."
