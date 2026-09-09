@@ -4,3 +4,4 @@ services:
   musicbrainz:
     volumes:
       - ${MUSICBRAINZ_CRONTAB_PATH:-./default/replication.cron}:/crons.conf
+      - ./scripts/enable-sir-indexing.sh:/usr/local/bin/enable-sir-indexing.sh:ro
