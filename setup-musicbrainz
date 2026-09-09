@@ -528,6 +528,9 @@ fi
 log "Live data mode: pgdata=$USE_HOST_PGDATA ($PGDATA_DIR), mqdata=$USE_HOST_MQDATA ($MQDATA_DIR), solrdata=$USE_HOST_SOLRDATA ($SOLRDATA_DIR)"
 
 log "Data root: $DATA_DIR"
+mkdir -p local/state
+printf '%s\n' "$DATA_DIR" > local/state/data-dir
+log "Recorded data root to local/state/data-dir for the self-heal service"
 log "Cache root: $CACHE_DIR"
 log "Live data root: $LIVE_DATA_DIR"
 log "Dump cache: $DBDUMP_DIR"
