@@ -6,6 +6,9 @@ BASE_DOWNLOAD_URL="${MUSICBRAINZ_BASE_FTP_URL:-$MUSICBRAINZ_BASE_DOWNLOAD_URL}"
 IMPORT="fullexport"
 FETCH_DUMPS=""
 WGET_OPTIONS=""
+TMP_DIR=/media/dbdump/tmp
+LOCAL_DUMP_DIR="$TMP_DIR/dumps"
+IMPORT_TMP_DIR="$TMP_DIR/import"
 
 HELP=$(cat <<EOH
 Usage: $0 [-wget-opts <options list>] [-sample] [-fetch] [MUSICBRAINZ_BASE_DOWNLOAD_URL]
@@ -54,7 +57,38 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-TMP_DIR=/media/dbdump/tmp
+stage_dumps_locally() {
+    local source_dir=/media/dbdump
+    local file
+    local checksum_line
+
+    mkdir -p "$LOCAL_DUMP_DIR" "$IMPORT_TMP_DIR"
+
+    for file in "${DUMP_FILES[@]}"; do
+        cp -f -- "$source_dir/$file" "$LOCAL_DUMP_DIR/$file"
+
+        if [[ -r "$source_dir/MD5SUMS" ]]; then
+            checksum_line=$(grep -F "*$file" "$source_dir/MD5SUMS" || true)
+            if [[ -z "$checksum_line" ]]; then
+                echo "$0: Missing checksum for staged dump '$file'"
+                exit 70
+            fi
+            if ! (cd "$LOCAL_DUMP_DIR" && printf '%s\n' "$checksum_line" | md5sum -c --status); then
+                echo "$0: Staged dump '$file' failed checksum validation"
+                exit 70
+            fi
+        fi
+
+        case "$file" in
+            *.bz2)
+                bzip2 -t -- "$LOCAL_DUMP_DIR/$file"
+                ;;
+            *.xz)
+                xz -t -- "$LOCAL_DUMP_DIR/$file"
+                ;;
+        esac
+    done
+}
 
 case "$IMPORT" in
     fullexport  )
@@ -98,31 +132,13 @@ dockerize -wait "tcp://${MUSICBRAINZ_POSTGRES_SERVER}:5432" -timeout 60s sleep 0
 
 update-perl.sh
 
-INITDB_OPTIONS=("--echo")
-MBIMPORT_OPTIONS=()
+stage_dumps_locally
+cd "$LOCAL_DUMP_DIR"
 
-if [[ "${#DUMP_FILES[@]}" -gt 0 ]]; then
-    for F in "${DUMP_FILES[@]}"; do
-        if ! [[ -a "/media/dbdump/$F" ]]; then
-            echo "$0: The dump '$F' is missing"
-            exit 1
-        fi
-    done
-
-    echo "found existing dumps"
-
-    mkdir -p "$TMP_DIR"
-    cd /media/dbdump
-
-    INITDB_OPTIONS+=("--import")
-    MBIMPORT_OPTIONS+=("--skip-editor" "--tmp-dir" "$TMP_DIR" "${DUMP_FILES[@]}")
-else
-    INITDB_OPTIONS+=("--clean")
-fi
-
+INITDB_OPTIONS='--echo --import'
 if ! /musicbrainz-server/script/database_exists MAINTENANCE; then
-    INITDB_OPTIONS+=("--createdb")
+    INITDB_OPTIONS="--createdb $INITDB_OPTIONS"
 fi
 
 # shellcheck disable=SC2086
-/musicbrainz-server/admin/InitDb.pl "${INITDB_OPTIONS[@]}" -- "${MBIMPORT_OPTIONS[@]}"
+/musicbrainz-server/admin/InitDb.pl $INITDB_OPTIONS -- --skip-editor --tmp-dir "$IMPORT_TMP_DIR" "${DUMP_FILES[@]}"

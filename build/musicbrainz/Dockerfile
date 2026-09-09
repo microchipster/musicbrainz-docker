@@ -1,20 +1,19 @@
 ARG METABRAINZ_BASE_IMAGE_VERSION=noble-1.0.2-v0.3
 ARG METABRAINZ_BASE_IMAGE_VARIANT=
 ARG METABRAINZ_BASE_IMAGE_TAG=${METABRAINZ_BASE_IMAGE_VERSION}${METABRAINZ_BASE_IMAGE_VARIANT}
-FROM metabrainz/base-image:${METABRAINZ_BASE_IMAGE_TAG}
+ARG MUSICBRAINZ_BASE_IMAGE=metabrainz/base-image:${METABRAINZ_BASE_IMAGE_TAG}
+FROM ${MUSICBRAINZ_BASE_IMAGE}
 
 ARG METABRAINZ_BASE_IMAGE_VERSION
 ARG METABRAINZ_BASE_IMAGE_VARIANT
 ARG METABRAINZ_BASE_IMAGE_TAG
-LABEL org.metabrainz.based-on-image="metabrainz/base-image:${METABRAINZ_BASE_IMAGE_TAG}"
+ARG MUSICBRAINZ_BASE_IMAGE
+LABEL org.metabrainz.based-on-image="${MUSICBRAINZ_BASE_IMAGE}"
 
 ARG DEBIAN_FRONTEND=noninteractive
 
 ARG TARGETARCH
 ARG DOCKERIZE_VERSION=v0.10.1
-RUN curl -sSLO --retry 5 https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSION/dockerize-linux-$TARGETARCH-$DOCKERIZE_VERSION.tar.gz && \
-    tar -C /usr/local/bin -xzvf dockerize-linux-$TARGETARCH-$DOCKERIZE_VERSION.tar.gz && \
-    rm -f dockerize-linux-$TARGETARCH-$DOCKERIZE_VERSION.tar.gz
 
 ARG PERL_VERSION=5.42.2
 ARG PERL_SRC_SUM=9384e8deb75b7b1695e5637971b752281aaecd025a3d5d4734d33c1d0adfee47
@@ -26,8 +25,15 @@ COPY keyrings/* /etc/apt/keyrings/
 ARG NODE_MAJOR_VERSION=24
 ARG POSTGRES_VERSION=18
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-RUN echo "deb [signed-by=/etc/apt/keyrings/nodesource.asc] https://deb.nodesource.com/node_${NODE_MAJOR_VERSION}.x nodistro main" > /etc/apt/sources.list.d/nodesource.list && \
-    echo "deb [signed-by=/etc/apt/keyrings/pgdg.asc] http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list && \
+RUN apt-get update && \
+    apt-get install --no-install-recommends -qy \
+        ca-certificates \
+        cron \
+        curl \
+        && \
+    . /etc/os-release && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.asc] https://deb.nodesource.com/node_${NODE_MAJOR_VERSION}.x nodistro main" > /etc/apt/sources.list.d/nodesource.list && \
+    echo "deb [signed-by=/etc/apt/keyrings/pgdg.asc] http://apt.postgresql.org/pub/repos/apt/ ${VERSION_CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list && \
     apt-get update && \
     apt-get install --no-install-recommends -qy \
         # Needed for building perl
@@ -61,6 +67,9 @@ RUN echo "deb [signed-by=/etc/apt/keyrings/nodesource.asc] https://deb.nodesourc
         # Needed for XML:LibXML
         zlib1g-dev \
         && \
+    curl -sSLO --retry 5 https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSION/dockerize-linux-$TARGETARCH-$DOCKERIZE_VERSION.tar.gz && \
+    tar -C /usr/local/bin -xzvf dockerize-linux-$TARGETARCH-$DOCKERIZE_VERSION.tar.gz && \
+    rm -f dockerize-linux-$TARGETARCH-$DOCKERIZE_VERSION.tar.gz && \
     rm -rf /var/lib/apt/lists/* && \
     # Install perl (in a more recent version than available with apt)
     cd /usr/src && \
