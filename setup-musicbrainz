@@ -1062,14 +1062,18 @@ ensure_bind_volume() {
   local device="$2"
   shift 2
   local volume_name
+  local volume_exists=0
   local configured_device
   local configured_opts
   local container_ids
   volume_name="$(compose_volume_name "$volume")"
+  docker volume inspect "$volume_name" > /dev/null 2>&1 && volume_exists=1
   configured_device="$(docker volume inspect -f '{{ index .Options "device" }}' "$volume_name" 2> /dev/null || :)"
   configured_opts="$(docker volume inspect -f '{{ index .Options "type" }}:{{ index .Options "o" }}' "$volume_name" 2> /dev/null || :)"
 
-  if [ -z "$configured_device" ] && { [ -z "$configured_opts" ] || [ "$configured_opts" = ':' ] || [ "$configured_opts" = '<no value>:<no value>' ]; }; then
+  if [ "$volume_exists" -eq 1 ] \
+    && [ -z "$configured_device" ] \
+    && { [ -z "$configured_opts" ] || [ "$configured_opts" = ':' ] || [ "$configured_opts" = '<no value>:<no value>' ]; }; then
     if [ "$MUSICBRAINZ_CONVERT_LOCAL_VOLUMES" != '1' ]; then
       echo "ERROR: volume $volume_name is a plain local Docker volume; converting it to a bind mount at $device would discard its data" >&2
       echo "Set MUSICBRAINZ_CONVERT_LOCAL_VOLUMES=1 to allow the conversion, or rerun with MUSICBRAINZ_USE_HOST_LIVE_DATA matching the original deployment" >&2
@@ -1083,7 +1087,11 @@ ensure_bind_volume() {
     return
   fi
 
-  log "Recreating $volume_name as a bind mount to $device"
+  if [ "$volume_exists" -eq 1 ]; then
+    log "Recreating $volume_name as a bind mount to $device"
+  else
+    log "Creating bind-mount volume $volume_name at $device"
+  fi
   docker compose stop "$@" || :
   docker compose rm -f "$@" || :
   container_ids="$(docker ps -aq --filter volume="$volume_name")"
