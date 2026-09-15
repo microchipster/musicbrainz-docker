@@ -102,9 +102,17 @@ tier2_rebuild_search() {
   log "Tier 2: rebuilding Solr from the verified backup cache (search-only downtime, ~3-4h)"
 
   local solrdata wipe_dir
-  solrdata="$(solrdata_dir)"
+  # Prefer the data root recorded by setup-musicbrainz: resolving the volume
+  # device needs docker socket access, which a systemd user service may lack
+  # (docker group membership is not always inherited by the user manager).
+  solrdata=""
+  if [ -n "$(data_dir)" ] && [ -d "$(data_dir)/solrdata" ]; then
+    solrdata="$(data_dir)/solrdata"
+  else
+    solrdata="$(solrdata_dir)"
+  fi
   if [ -z "$solrdata" ] || [ ! -d "$solrdata" ]; then
-    log "Tier 2: could not resolve the solrdata bind-mount device; aborting"
+    log "Tier 2: could not resolve the solrdata bind-mount device (docker socket access or data root?); aborting"
     return
   fi
 
@@ -174,7 +182,7 @@ main() {
 
   tier0_restart_indexing
 
-  if grep -aq 'Replication is stale' "$VERIFY_LOG"; then
+  if grep -aqE 'Replication is stale|Replication is behind upstream' "$VERIFY_LOG"; then
     tier1_catch_up_replication
     return
   fi
