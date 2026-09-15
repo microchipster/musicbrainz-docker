@@ -502,8 +502,12 @@ check_live_indexing() {
   fi
 
   if [ "${processable_count:-0}" -eq 0 ]; then
-    echo "Live indexing cannot make progress: all ${backlog_count} pending change(s) exhausted their retry attempts" >&2
-    return 1
+    # Exhausted rows are a data condition (for example one entity whose
+    # dependency graph exceeds the indexer's row limit), not proof that live
+    # indexing is unhealthy. Failing here would drive automated remediation
+    # into repeated destructive rebuilds, so report and continue.
+    echo "Live indexing warning: all ${backlog_count} pending change(s) exhausted their retry attempts; inspect sir.pending_data" >&2
+    return 0
   fi
 
   if [ "${stuck_count:-0}" -gt 0 ]; then
