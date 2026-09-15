@@ -2,8 +2,11 @@
 Description=Run the MusicBrainz self-healing check every 30 minutes
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=30min
+# Use a wall-clock cadence rather than monotonic OnBootSec/OnUnitActiveSec:
+# monotonic timers lose their schedule when the systemd user manager is
+# restarted (e.g. after adding the user to the docker group), leaving the
+# self-heal monitor silently dead.
+OnCalendar=*:0/30
 Persistent=true
 
 [Install]
