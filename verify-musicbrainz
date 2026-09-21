@@ -206,6 +206,14 @@ db_psql() {
   docker compose exec -T db psql -U musicbrainz -d musicbrainz_db -At -F $'\t' "$@"
 }
 
+replication_running() {
+  # A replication run disables live indexing while it imports each packet
+  # (LoadReplicationChanges calls toggle_search_indexing(0) per packet and only
+  # re-enables it when it reaches the upstream boundary). An indexing-disabled
+  # state during a run is therefore normal, not a failure.
+  docker compose exec -T musicbrainz sh -c 'ps -ef 2> /dev/null | grep -q "[L]oadReplicationChanges"' > /dev/null 2>&1
+}
+
 require_running_services() {
   local running
   local service
@@ -476,6 +484,10 @@ check_live_indexing() {
 
   enabled="$(db_psql -c "SELECT indexing_enabled FROM sir.control;" 2> /dev/null || true)"
   if [ "$enabled" != "t" ]; then
+    if replication_running; then
+      log "Live indexing paused while a replication run is in progress (sir.control.indexing_enabled is '${enabled:-unknown}')"
+      return 0
+    fi
     echo "Live indexing is disabled: sir.control.indexing_enabled is '${enabled:-unknown}' (expected true)" >&2
     return 1
   fi

@@ -69,6 +69,10 @@ replication_sequence() {
     "SELECT current_replication_sequence FROM musicbrainz.replication_control ORDER BY id DESC LIMIT 1" 2> /dev/null
 }
 
+replication_running() {
+  docker compose exec -T musicbrainz sh -c 'ps -ef 2> /dev/null | grep -q "[L]oadReplicationChanges"' > /dev/null 2>&1
+}
+
 tier1_catch_up_replication() {
   log "Tier 1: replication is stale; running catch-up with the indexer paused"
   pause_indexer
@@ -78,19 +82,19 @@ tier1_catch_up_replication() {
     return
   }
 
-  local last="" current stalls=0 waited=0
+  # Wait for the replication process to exit. The sequence alone is not a
+  # completion signal: a large packet can hold it still for many minutes, and
+  # treating that as "finished" would re-enable indexing while the run is still
+  # toggling it off per packet.
+  local current waited=0
   while [ "$waited" -lt "$TIER1_MAX_WAIT" ]; do
     sleep 300
     waited=$((waited + 300))
-    current="$(replication_sequence)"
-    if [ -n "$current" ] && [ "$current" = "$last" ]; then
-      stalls=$((stalls + 1))
-      [ "$stalls" -ge 2 ] && break
-    else
-      stalls=0
+    if ! replication_running; then
+      break
     fi
-    last="$current"
-    log "Tier 1: catch-up in progress (sequence ${current:-unknown})"
+    current="$(replication_sequence)"
+    log "Tier 1: catch-up in progress (sequence ${current:-unknown}, waited ${waited}s)"
   done
 
   docker compose exec -T musicbrainz /usr/local/bin/enable-sir-indexing.sh > /dev/null 2>&1 || :
@@ -193,6 +197,10 @@ main() {
     last_wipe="$(cat "$WIPE_STAMP" 2> /dev/null || echo never)"
     if [ "$last_wipe" = "$today" ]; then
       log "Tier 2: already rebuilt today; waiting for the next window"
+      return
+    fi
+    if replication_running; then
+      log "Tier 2: a replication run is in progress; deferring the rebuild"
       return
     fi
     tier2_rebuild_search
