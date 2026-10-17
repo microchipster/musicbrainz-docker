@@ -11,8 +11,9 @@
 #          rare)           directory and rebuild search from the verified local
 #                          backup cache via ./setup-musicbrainz. The wipe clears
 #                          lost ZooKeeper coordination state, not source data.
-# Tier 2 only runs after 3 consecutive failed verifications and at most once
-# per day. Set MUSICBRAINZ_AUTO_HEAL=0 to disable all healing actions.
+# Tier 2 only runs after 3 consecutive failed verifications, at most once
+# per day, and never while a setup-musicbrainz or replication run is active.
+# Set MUSICBRAINZ_AUTO_HEAL=0 to disable all healing actions.
 
 set -uo pipefail
 
@@ -73,6 +74,26 @@ replication_running() {
   docker compose exec -T musicbrainz sh -c 'ps -ef 2> /dev/null | grep -q "[L]oadReplicationChanges"' > /dev/null 2>&1
 }
 
+setup_lock_path() {
+  printf '%s/setup.lock\n' "$(data_dir)"
+}
+
+setup_running() {
+  # A running setup-musicbrainz holds an exclusive flock on
+  # <data-dir>/setup.lock. Rebuilding (wiping solrdata) underneath a setup run
+  # would corrupt it, so either signal meaning "running" defers Tier 2.
+  if pgrep -f 'bash [.]/setup-musicbrainz' > /dev/null 2>&1; then
+    return 0
+  fi
+  local lock
+  lock="$(setup_lock_path)"
+  [ -f "$lock" ] || return 1
+  if ! flock -n "$lock" true > /dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
 tier1_catch_up_replication() {
   log "Tier 1: replication is stale; running catch-up with the indexer paused"
   pause_indexer
@@ -122,6 +143,15 @@ tier2_rebuild_search() {
 
   if ! sudo -n true 2> /dev/null; then
     log "Tier 2: passwordless sudo unavailable; cannot wipe $solrdata; aborting"
+    return
+  fi
+
+  if setup_running; then
+    log "Tier 2: a setup-musicbrainz run is in progress; aborting to protect it"
+    return
+  fi
+  if replication_running; then
+    log "Tier 2: a replication run started; aborting to protect the mirror"
     return
   fi
 
@@ -201,6 +231,10 @@ main() {
     fi
     if replication_running; then
       log "Tier 2: a replication run is in progress; deferring the rebuild"
+      return
+    fi
+    if setup_running; then
+      log "Tier 2: a setup-musicbrainz run is in progress; deferring the rebuild"
       return
     fi
     tier2_rebuild_search
