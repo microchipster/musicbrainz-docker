@@ -1,0 +1,10 @@
+[Unit]
+Description=MusicBrainz role reconcile (enforce a single hot database)
+Documentation=https://git.underzsea.com/microchipster/musicbrainz-docker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO_DIR@
+ExecStart=@REPO_DIR@/scripts/role-reconcile.sh

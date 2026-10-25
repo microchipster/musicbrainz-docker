@@ -1,0 +1,11 @@
+[Unit]
+Description=Run MusicBrainz role reconcile every 5 minutes
+
+[Timer]
+# Wall-clock cadence on purpose: survives user-manager restarts unlike
+# monotonic timers, matching the self-heal timer convention.
+OnCalendar=*:0/5
+Persistent=true
+
+[Install]
+WantedBy=timers.target
