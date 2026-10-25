@@ -1,0 +1,27 @@
+# Pi1 backup mirror: sized to coexist with yacy (~4GB).
+services:
+  db:
+    mem_limit: 1g
+    memswap_limit: 1g
+    shm_size: "1GB"
+    command: postgres -c "shared_buffers=512MB" -c "maintenance_work_mem=128MB" -c "wal_compression=on" -c "max_wal_size=4GB" -c "checkpoint_timeout=30min" -c "checkpoint_completion_target=0.9" -c "max_parallel_maintenance_workers=0" -c "max_parallel_workers_per_gather=0" -c "max_parallel_workers=0" -c "jit=off" -c "listen_addresses=*"
+  search:
+    mem_limit: 3g
+    memswap_limit: 3g
+    environment:
+      SOLR_HEAP: 1g
+      SOLR_OPTS: "-Dsolr.sharedLib=/usr/lib/mbsssss/lib -Xmx1g -Dcollections.api.async.timeout=3600000"
+  musicbrainz:
+    mem_limit: 1g
+    memswap_limit: 1g
+    environment:
+      MUSICBRAINZ_SERVER_PROCESSES: "3"
+  indexer:
+    # 2026-10-25: 500m was too small. SIR's pool workers reach ~370-380MB RSS;
+    # the cgroup OOM killer killed them mid-task and Pool.imap never completes,
+    # silently wedging live indexing for hours (container stayed "up").
+    mem_limit: 1g
+    memswap_limit: 1g
+  valkey:
+    mem_limit: 128m
+    memswap_limit: 128m

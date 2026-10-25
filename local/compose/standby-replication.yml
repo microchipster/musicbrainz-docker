@@ -1,0 +1,7 @@
+# Description: Publish the database for the nas streaming standby (2026-10-22).
+# The nas replica pulls its base backup and streams WAL from this host.
+services:
+  db:
+    ports:
+      - "192.168.50.155:5432:5432"
+      - "10.13.13.14:5432:5432"
