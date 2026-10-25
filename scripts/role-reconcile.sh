@@ -118,7 +118,13 @@ if [ -z "$peer" ]; then
   exit 0
 fi
 if [ "$peer" != "f" ]; then
-  say "peer $peer_host is a standby; replication topology healthy"
+  peer_rx="$(peer_psql 'select status from pg_stat_wal_receiver')"
+  if [ "$peer_rx" = "streaming" ]; then
+    say "peer $peer_host is a streaming standby; replication topology healthy"
+  else
+    alert "MusicBrainz role reconcile: peer $peer_host is a standby but NOT streaming (wal receiver: ${peer_rx:-none}); the replication link is broken (check the db port publish + pg_hba; see the 2026-10-25 incident). Fix on $(hostname): ./admin/configure add local/compose/standby-replication.yml && docker compose up -d --no-build db"
+    exit 1
+  fi
   exit 0
 fi
 
