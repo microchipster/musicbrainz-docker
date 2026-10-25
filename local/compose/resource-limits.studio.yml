@@ -1,0 +1,43 @@
+# Description: Soft resource weights so the MusicBrainz stack yields to other
+# applications under contention while using full capacity when idle.
+# Applied automatically by setup-musicbrainz when this file exists.
+# Memory caps bound worst-case RSS; adjust to the host's available RAM.
+
+services:
+  db:
+    cpu_shares: 256
+    blkio_config:
+      weight: 200
+    mem_limit: 3g
+    memswap_limit: 3g
+    shm_size: "1GB"
+    command: postgres -c "shared_buffers=1024MB" -c "maintenance_work_mem=512MB" -c "wal_compression=on" -c "max_wal_size=16GB" -c "checkpoint_timeout=30min" -c "checkpoint_completion_target=0.9" -c "max_parallel_maintenance_workers=0" -c "max_parallel_workers_per_gather=0" -c "max_parallel_workers=0" -c "jit=off" -c "listen_addresses=*"
+  musicbrainz:
+    cpu_shares: 256
+    blkio_config:
+      weight: 200
+    mem_limit: 1.5g
+    memswap_limit: 1.5g
+    environment:
+      MUSICBRAINZ_SERVER_PROCESSES: "4"
+  search:
+    cpu_shares: 256
+    blkio_config:
+      weight: 200
+    mem_limit: 5g
+    memswap_limit: 5g
+    environment:
+      SOLR_HEAP: 1536m
+      SOLR_OPTS: "-Dsolr.sharedLib=/usr/lib/mbsssss/lib -Xmx1536m -Dcollections.api.async.timeout=3600000"
+  indexer:
+    cpu_shares: 256
+    blkio_config:
+      weight: 200
+    mem_limit: 1g
+    memswap_limit: 1g
+  valkey:
+    cpu_shares: 256
+    blkio_config:
+      weight: 200
+    mem_limit: 256m
+    memswap_limit: 256m
