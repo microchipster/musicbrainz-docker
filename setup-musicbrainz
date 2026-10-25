@@ -622,6 +622,28 @@ if [ -f local/compose/resource-limits.yml ]; then
   log "Applying local resource-limits compose override"
 fi
 
+# Operator-declared extra compose files (2026-10-25): admin/configure rewrites
+# COMPOSE_FILE from the array above, which silently dropped the standby
+# replication override and broke the nas streaming standby. Anything listed in
+# local/compose-extra.txt is preserved here: one relative path per line, blank
+# lines and '#' comments skipped, missing files logged as warnings.
+if [ -f local/compose-extra.txt ]; then
+  while IFS= read -r extra; do
+    extra="${extra%$'\r'}"
+    extra="${extra#"${extra%%[![:space:]]*}"}"
+    extra="${extra%"${extra##*[![:space:]]}"}"
+    case "$extra" in
+      '' | '#'*) continue ;;
+    esac
+    if [ -f "$extra" ]; then
+      COMPOSE_FILES+=("$extra")
+      log "Preserving operator-declared compose extra: $extra"
+    else
+      log "WARNING: local/compose-extra.txt lists a missing file: $extra"
+    fi
+  done < local/compose-extra.txt
+fi
+
 admin/configure with "${COMPOSE_FILES[@]}" > /dev/null
 log "Compose files configured: $(join_by_colon "${COMPOSE_FILES[@]}")"
 
