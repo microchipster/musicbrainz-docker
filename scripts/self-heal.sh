@@ -55,6 +55,10 @@ resume_indexer() { docker compose up -d --no-build indexer > /dev/null 2>&1 || :
 tier0_restart_indexing() {
   log "Tier 0: restarting live indexing"
   resume_indexer
+  # 2026-10-25: `up -d` is a no-op when the container already runs, so a
+  # wedged `sir live` process survived 20 Tier-0 cycles (backlog frozen at
+  # 1.8M for 16h). A real restart is what clears the wedge.
+  docker compose restart indexer > /dev/null 2>&1 || :
   docker compose exec -T musicbrainz /usr/local/bin/enable-sir-indexing.sh > /dev/null 2>&1 \
     || log "Tier 0: enable-sir-indexing failed (sir schema may be absent; ignoring)"
   if docker compose exec -T db psql -U musicbrainz -d musicbrainz_db -At -c \
